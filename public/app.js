@@ -7,7 +7,7 @@ function setConst(c) {
   PRIO = Object.fromEntries(C.priorities.map(p => [p.id, p]));
   PERM_LABEL = Object.fromEntries(C.permissions.map(p => [p.id, p.label]));
 }
-const State = {me:null, perms:new Set(), level:0, users:[], items:[], roles:[], tasks:[], v:null, prefs:{}, module:'home', refreshPending:false};
+const State = {me:null, perms:new Set(), level:0, users:[], items:[], roles:[], tasks:[], posts:[], recurrences:[], v:null, prefs:{}, module:'home', refreshPending:false};
 const MOBILE_MQ = matchMedia('(max-width: 760px)');
 const isMobile = () => MOBILE_MQ.matches;
 
@@ -21,6 +21,22 @@ const isAdmin = () => can('system.admin');
 const userById = id => State.users.find(u => u.id === id);
 const itemById = id => State.items.find(i => i.id === id);
 const taskById = id => State.tasks.find(t => t.id === id);
+const seriesById = id => State.recurrences.find(r => r.id === id);
+// "Minha" = sou o responsável principal; "ajudo" = estou no apoio ou tenho alguma etapa.
+const isMine = t => t.assignee_id === State.me.id;
+// Repetições geram semanas de tarefas à frente; fora do calendário, mostra só a próxima
+// ocorrência "a fazer" de cada série (as que já andaram ou estão atrasadas continuam aparecendo).
+function collapseRecur(list) {
+  const seen = new Set(), today = todayISO(); let hidden = 0;
+  const out = [...list].sort((a, b) => (a.due_date || '').localeCompare(b.due_date || '')).filter(t => {
+    if (!t.recur_id || t.status !== 'todo' || (t.due_date && t.due_date < today)) return true;
+    if (seen.has(t.recur_id)) { hidden++; return false; }
+    seen.add(t.recur_id); return true;
+  });
+  const keep = new Set(out);
+  return {list:list.filter(t => keep.has(t)), hidden};
+}
+const helpsIn = t => !isMine(t) && ((t.members || []).includes(State.me.id) || (t.sub_users || []).includes(State.me.id));
 const pad = n => String(n).padStart(2, '0');
 const toISO = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 const todayISO = () => toISO(new Date());
@@ -87,6 +103,9 @@ const P = {
   sync:'<path d="M4 12a8 8 0 0 1 14-5.3L20 9"/><path d="M20 4v5h-5"/><path d="M20 12a8 8 0 0 1-14 5.3L4 15"/><path d="M4 20v-5h5"/>',
   flag:'<path d="M4 22V4"/><path d="M4 4h12l-2 4 2 4H4"/>', send:'<path d="m22 2-7 20-4-9-9-4z"/><path d="M22 2 11 13"/>',
   sparkle:'<path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/>',
+  megaphone:'<path d="M3 11v2a1 1 0 0 0 1 1h2l5 4V6L6 10H4a1 1 0 0 0-1 1z"/><path d="M15 8a5 5 0 0 1 0 8"/><path d="M18 5a9 9 0 0 1 0 14"/>',
+  crown:'<path d="m3 7 4.5 4L12 4l4.5 7L21 7l-2 12H5z"/>', repeat:'<path d="m17 2 4 4-4 4"/><path d="M3 11V9a3 3 0 0 1 3-3h15"/><path d="m7 22-4-4 4-4"/><path d="M21 13v2a3 3 0 0 1-3 3H3"/>',
+  pin:'<path d="M12 17v5"/><path d="M5 17h14l-2-4V6a2 2 0 0 0 0-4H7a2 2 0 0 0 0 4v7z"/>', checklist:'<path d="m3 6 2 2 3-3"/><path d="m3 13 2 2 3-3"/><path d="M11 7h10M11 14h10M11 20h10"/><path d="M4 20h2"/>',
 };
 const icon = (n, s = 18) => `<svg class="ic" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${P[n] || ''}</svg>`;
 
@@ -99,6 +118,29 @@ function pill(label, color, act) { return `<span class="pill ${act ? 'click' : '
 function userCell(id) { const u = userById(id); return u ? `<div class="user-cell">${avatar(u, 26)}<span>${esc(shortName(u.full_name))}</span></div>` : '<span class="muted">—</span>'; }
 function itemTag(t) { return t.item_id ? `<span class="item-tag" style="--c:${t.item_color || '#94a3b8'}"><span class="sq"></span>${esc(t.item_name)}</span>` : '<span class="muted">—</span>'; }
 function rolePill(u) { return u.role_name ? pill(u.role_name, u.role_color || '#64748b') : ''; }
+// Selo de capitão / vice-capitão (título de destaque; não muda permissões).
+const BADGES = {captain:{label:'Capitão', color:'#eab308'}, vice:{label:'Vice-capitão', color:'#a855f7'}};
+function badgeHtml(u, compact) {
+  const b = u && BADGES[u.badge]; if (!b) return '';
+  return `<span class="capt ${compact ? 'compact' : ''}" style="--c:${b.color}" title="${b.label} da equipe">${icon('crown', compact ? 12 : 13)}${compact ? '' : b.label}</span>`;
+}
+function avatarStack(ids, size = 24, max = 4) {
+  const us = ids.map(userById).filter(Boolean); if (!us.length) return '';
+  return `<span class="astack">${us.slice(0, max).map(u => avatar(u, size)).join('')}${us.length > max ? `<span class="avatar more-av" style="width:${size}px;height:${size}px;font-size:${Math.round(size * .38)}px">+${us.length - max}</span>` : ''}</span>`;
+}
+const peopleOf = t => [t.assignee_id, ...(t.members || [])].filter(Boolean);
+function subChip(t) { return t.sub_total ? `<span class="subchip ${t.sub_done === t.sub_total ? 'full' : ''}" title="Etapas concluídas">${icon('checklist', 13)}${t.sub_done}/${t.sub_total}</span>` : ''; }
+function recurMark(t) { return t.recur_id ? `<span class="recur-mark" title="Tarefa que se repete">${icon('repeat', 13)}</span>` : ''; }
+const WD_SHORT = ['dom','seg','ter','qua','qui','sex','sáb'];
+function freqText(r) {
+  const n = r.every || 1, unit = {daily:['dia','dias'], weekly:['semana','semanas'], monthly:['mês','meses']}[r.freq] || ['',''];
+  let txt = n === 1 ? (r.freq === 'daily' ? 'Todo dia' : r.freq === 'weekly' ? 'Toda semana' : 'Todo mês') : `A cada ${n} ${unit[1]}`;
+  if (r.freq === 'weekly' && r.weekdays && r.weekdays.length) txt += ` (${r.weekdays.map(d => WD_SHORT[d]).join(', ')})`;
+  if (r.freq === 'monthly') txt += `, dia ${parseISO(r.start_date).getDate()}`;
+  if (r.due_time) txt += ` às ${r.due_time}`;
+  if (r.end_date) txt += ` · até ${fmtDate(r.end_date, true)}`;
+  return txt;
+}
 function progressHtml(p) { return `<div class="prog-cell"><div class="progress"><i style="width:${p}%"></i></div>${p}%</div>`; }
 function dueHtml(t) {
   if (!t.due_date) return '<span class="muted">—</span>';
@@ -109,7 +151,8 @@ function dueHtml(t) {
   else if (n === 1) { cls = 'soon'; txt = 'Amanhã'; }
   else if (n < 7) txt = cap(WEEKDAYS[parseISO(t.due_date).getDay()]);
   else txt = fmtDate(t.due_date);
-  return `<span class="due ${cls}" title="${fmtDate(t.due_date, true)}">${icon(cls === 'late' ? 'alert' : 'calendar', 14)}${txt}</span>`;
+  if (t.due_time) txt += ` · ${t.due_time}`;
+  return `<span class="due ${cls}" title="${fmtDate(t.due_date, true)}${t.due_time ? ' às ' + t.due_time : ''}">${icon(cls === 'late' ? 'alert' : 'calendar', 14)}${txt}</span>`;
 }
 function emptyState(title, text, btn) {
   return `<div class="empty"><div class="big">${icon('sparkle', 34)}</div><h3>${esc(title)}</h3><p>${esc(text)}</p>${btn || ''}</div>`;
@@ -242,7 +285,8 @@ async function enterApp() {
 }
 async function refreshData() {
   const d = await call('app.data');
-  Object.assign(State, {me:d.me, perms:new Set(d.perms), level:d.level, users:d.users, items:d.items, roles:d.roles, tasks:d.tasks, v:d.v});
+  Object.assign(State, {me:d.me, perms:new Set(d.perms), level:d.level, users:d.users, items:d.items, roles:d.roles, tasks:d.tasks,
+    posts:d.posts || [], recurrences:d.recurrences || [], v:d.v});
 }
 async function reload() {
   try { await refreshData(); } catch (e) { return; }
@@ -296,7 +340,8 @@ function renderNav() {
   $$('a', nav).forEach(a => a.onclick = () => go(a.dataset.mod));
 }
 function renderMe() {
-  const b = $('#meBox'); if (b && State.me) b.innerHTML = `${avatar(State.me, 36)}<div class="who"><b>${esc(State.me.full_name)}</b><small>${esc(State.me.role_name || '')}</small></div>`;
+  const bd = BADGES[State.me && State.me.badge];
+  const b = $('#meBox'); if (b && State.me) b.innerHTML = `${avatar(State.me, 36)}<div class="who"><b>${esc(State.me.full_name)}</b><small>${esc(bd ? bd.label : State.me.role_name || '')}</small></div>`;
   const mm = $('#meMobile'); if (mm && State.me) mm.innerHTML = avatar(State.me, 36);
 }
 MOBILE_MQ.addEventListener('change', () => { if (State.me && $('#view')) rerender(); });
@@ -326,13 +371,16 @@ registerModule({id:'home', title:'Início', icon:'home', section:'Trabalho',
   render(view, actions) {
     if (can('tasks.create')) { actions.innerHTML = `<button class="btn primary" id="hNew">${icon('plus')} Nova tarefa</button>`; $('#hNew').onclick = () => openTask(null); }
     const me = State.me.id, open = State.tasks.filter(t => t.status !== 'done');
-    const mine = open.filter(t => t.assignee_id === me), late = mine.filter(isLate);
+    const mine = collapseRecur(open.filter(t => t.assignee_id === me)).list, late = mine.filter(isLate), helping = collapseRecur(open.filter(helpsIn)).list;
     const week = mine.filter(t => t.due_date && daysUntil(t.due_date) >= 0 && daysUntil(t.due_date) <= 7);
     const done30 = State.tasks.filter(t => t.status === 'done' && t.completed_at && Date.now() - Date.parse(t.completed_at) < 30 * 864e5);
     const stat = (label, n, ic, c, key) => `<div class="card stat" data-stat="${key}" style="--c:${c}"><div class="sico">${icon(ic, 22)}</div><div><b>${n}</b><span>${label}</span></div></div>`;
     const next = [...mine].sort((a, b) => (a.due_date || '9999').localeCompare(b.due_date || '9999') || b.priority - a.priority).slice(0, 7);
-    const mineHtml = next.length ? next.map(t => `<div class="mini-task" data-id="${t.id}"><span class="sdot" style="--c:${PRIO[t.priority].color}"></span><div class="t"><b>${esc(t.title)}</b><span class="muted sm">${esc(t.item_name || 'Sem item')} · ${STATUS[t.status].label}</span></div>${dueHtml(t)}</div>`).join('')
-      : `<div class="empty" style="padding:30px"><h3>Nada pendente 🎉</h3><p>Você não tem tarefas abertas.</p></div>`;
+    const mineHtml = (next.length ? next.map(t => `<div class="mini-task" data-id="${t.id}"><span class="sdot" style="--c:${PRIO[t.priority].color}"></span><div class="t"><b>${recurMark(t)}${esc(t.title)}</b><span class="muted sm">${esc(t.item_name || 'Sem item')} · ${STATUS[t.status].label}${t.sub_total ? ` · ${t.sub_done}/${t.sub_total} etapas` : ''}</span></div>${dueHtml(t)}</div>`).join('')
+      : `<div class="empty" style="padding:30px"><h3>Nada pendente 🎉</h3><p>Você não tem tarefas abertas.</p></div>`)
+      + (helping.length ? `<a class="help-line" data-stat="help">${icon('users', 15)} Você também ajuda em ${plural(helping.length, 'tarefa aberta', 'tarefas abertas')} →</a>` : '');
+    const posts = State.posts.slice(0, 3);
+    const muralHtml = posts.length ? `<div class="card mural-home"><div class="card-h"><h3>${icon('megaphone', 17)} Mural</h3><a class="ml" data-go="mural">Ver tudo</a></div><div class="card-b">${posts.map(p => postHtml(p, true)).join('')}</div></div>` : '';
     const itemsHtml = State.items.map(i => {
       const ts = State.tasks.filter(t => t.item_id === i.id); if (!ts.length) return '';
       const seg = C.statuses.map(s => { const n = ts.filter(t => t.status === s.id).length; return n ? `<i style="width:${n / ts.length * 100}%;background:${s.color}" title="${s.label}: ${n}"></i>` : ''; }).join('');
@@ -341,23 +389,85 @@ registerModule({id:'home', title:'Início', icon:'home', section:'Trabalho',
     }).join('') || '<p class="muted">Nenhuma tarefa cadastrada ainda.</p>';
     let teamHtml = '';
     if (can('tasks.view_all')) {
-      const loads = State.users.filter(u => u.active).map(u => ({u, n:open.filter(t => t.assignee_id === u.id).length, l:open.filter(t => t.assignee_id === u.id && isLate(t)).length})).filter(x => x.n).sort((a, b) => b.n - a.n).slice(0, 10);
+      const openC = collapseRecur(open).list;
+      const loads = State.users.filter(u => u.active).map(u => ({u, n:openC.filter(t => t.assignee_id === u.id).length, l:openC.filter(t => t.assignee_id === u.id && isLate(t)).length})).filter(x => x.n).sort((a, b) => b.n - a.n).slice(0, 10);
       const max = Math.max(1, ...loads.map(x => x.n));
       teamHtml = `<div class="card mt"><div class="card-h"><h3>Carga da equipe</h3><span class="muted sm">tarefas abertas por integrante</span></div><div class="card-b">${loads.length ? loads.map(x => `<div class="load-row" data-user="${x.u.id}" style="cursor:pointer"><span class="nm">${avatar(x.u, 24)}${esc(shortName(x.u.full_name))}</span><div class="load-bar"><i style="width:${x.n / max * 100}%"></i></div><span class="sm" style="width:90px;text-align:right"><b>${x.n}</b>${x.l ? ` <span class="red">· ${x.l} atras.</span>` : ''}</span></div>`).join('') : '<p class="muted">Ninguém com tarefas abertas.</p>'}</div></div>`;
     }
     view.innerHTML = `<div class="hello"><h2>${greeting()}, ${esc(State.me.full_name.split(' ')[0])}! 👋</h2><p>Você tem <b>${plural(mine.length, 'tarefa aberta', 'tarefas abertas')}</b>${late.length ? ` — <b class="red">${plural(late.length, 'atrasada', 'atrasadas')}</b>` : ''}.</p></div>
-      <div class="stats">${stat('Minhas abertas', mine.length, 'tasks', '#3b82f6', 'mine')}${stat('Minhas atrasadas', late.length, 'alert', '#ef4444', 'late')}${stat('Vencem em 7 dias', week.length, 'clock', '#f59e0b', 'week')}${stat('Concluídas em 30 dias', done30.length, 'check', '#22c55e', 'done')}</div>
+      ${muralHtml}<div class="stats">${stat('Minhas abertas', mine.length, 'tasks', '#3b82f6', 'mine')}${stat('Minhas atrasadas', late.length, 'alert', '#ef4444', 'late')}${stat('Vencem em 7 dias', week.length, 'clock', '#f59e0b', 'week')}${stat('Concluídas em 30 dias', done30.length, 'check', '#22c55e', 'done')}</div>
       <div class="dash"><div class="card"><div class="card-h"><h3>Minhas próximas tarefas</h3><a class="ml" data-stat="mine">Ver todas</a></div><div style="padding-bottom:8px">${mineHtml}</div></div>
       <div class="card"><div class="card-h"><h3>Andamento por item</h3></div><div class="card-b">${itemsHtml}<div class="legend mt">${C.statuses.map(s => `<span><i style="background:${s.color}"></i>${s.label}</span>`).join('')}</div></div></div></div>${teamHtml}`;
     $$('[data-stat]', view).forEach(el => el.onclick = () => {
       const k = el.dataset.stat;
-      if (k === 'mine') gotoTasks({user:'__me'}); else if (k === 'late') gotoTasks({user:'__me', status:'late'});
+      if (k === 'mine') gotoTasks({user:'__me'}); else if (k === 'help') gotoTasks({user:'__help'}); else if (k === 'late') gotoTasks({user:'__me', status:'late'});
       else if (k === 'week') gotoTasks({user:'__me', status:'week'}); else gotoTasks({status:'done'});
     });
     $$('[data-id]', view).forEach(el => el.onclick = () => openTask(el.dataset.id));
+    $$('[data-go]', view).forEach(el => el.onclick = () => go(el.dataset.go));
+    $$('[data-post]', view).forEach(el => el.onclick = () => go('mural'));
     $$('[data-item]', view).forEach(el => el.onclick = () => gotoTasks({item:el.dataset.item}));
     $$('[data-user]', view).forEach(el => el.onclick = () => gotoTasks({user:el.dataset.user}));
   }});
+
+// ═══════════ MÓDULO: MURAL ═══════════
+function postHtml(p, compact) {
+  const u = userById(p.user_id) || {id:p.user_id || 'x', full_name:p.user_name || '?'};
+  const edited = p.updated_at && p.updated_at !== p.created_at;
+  const acts = compact ? '' : `<span class="post-acts">${can('mural.manage') ? `<button class="btn ghost icon" data-pin="${p.id}" title="${p.pinned ? 'Desafixar' : 'Fixar no topo'}">${icon('pin', 16)}</button>` : ''}${p.can_edit ? `<button class="btn ghost icon" data-pedit="${p.id}" title="Editar">${icon('edit', 16)}</button>` : ''}${p.can_delete ? `<button class="btn ghost icon" data-pdel="${p.id}" title="Apagar">${icon('trash', 16)}</button>` : ''}</span>`;
+  return `<div class="post ${p.pinned ? 'pinned' : ''} ${compact ? 'compact' : ''}" data-post="${p.id}">
+    <div class="post-head">${avatar(u, compact ? 26 : 34)}<div class="who"><b>${esc(shortName(u.full_name))}</b>${badgeHtml(userById(p.user_id), true)}<span class="muted sm" title="${fmtDateTime(p.created_at)}">${timeAgo(p.created_at)}${edited ? ' · editado' : ''}</span></div>${p.pinned ? `<span class="pin-tag">${icon('pin', 13)} Fixado</span>` : ''}${acts}</div>
+    ${p.title ? `<div class="post-title">${esc(p.title)}</div>` : ''}<div class="post-body">${esc(p.body)}</div></div>`;
+}
+const unseenPosts = () => State.posts.filter(p => p.user_id !== State.me.id && p.created_at > (State.prefs.mural_seen || '')).length;
+registerModule({id:'mural', title:'Mural', icon:'megaphone', section:'Trabalho', subtitle:'Recados gerais para toda a equipe',
+  badge:() => { const n = State.module === 'mural' ? 0 : unseenPosts(); return {n, hot:n > 0}; },
+  render(view) {
+    view.innerHTML = `<div class="card composer"><div class="post-head">${avatar(State.me, 34)}<input class="input" id="pmTitle" placeholder="Título (opcional)" maxlength="120"></div>
+      <textarea class="input" id="pmBody" rows="3" placeholder="Escreva um recado para a equipe… (Ctrl+Enter publica)"></textarea>
+      <div class="row">${can('mural.manage') ? '<label class="inline-check"><input type="checkbox" id="pmPin"> Fixar no topo</label>' : ''}<button class="btn primary ml" id="pmSend">${icon('send', 15)} Publicar</button></div></div>
+      <div id="muralList" class="mural-list"></div>`;
+    const send = async () => {
+      const body = $('#pmBody').value.trim(); if (!body) return $('#pmBody').focus();
+      const b = $('#pmSend'); b.disabled = true;
+      try {
+        await call('posts.save', {post:{title:$('#pmTitle').value, body, pinned:!!($('#pmPin') && $('#pmPin').checked)}});
+        $('#pmTitle').value = ''; $('#pmBody').value = ''; if ($('#pmPin')) $('#pmPin').checked = false;
+        toast('Recado publicado 📣', 'ok'); await reload();
+      } catch (e) { toast(e.message, 'err'); }
+      b.disabled = false;
+    };
+    $('#pmSend').onclick = send;
+    $('#pmBody').addEventListener('keydown', e => { if (e.key === 'Enter' && e.ctrlKey) { e.preventDefault(); send(); } });
+    $('#muralList').onclick = async e => {
+      const pin = e.target.closest('[data-pin]'), ed = e.target.closest('[data-pedit]'), del = e.target.closest('[data-pdel]');
+      const btn = pin || ed || del; if (!btn) return;
+      const p = State.posts.find(x => x.id === (btn.dataset.pin || btn.dataset.pedit || btn.dataset.pdel));
+      if (!p) return;
+      try {
+        if (pin) { await call('posts.pin', {id:p.id, pinned:!p.pinned}); await reload(); }
+        else if (ed) openPost(p);
+        else if (await confirmDlg('Apagar este recado do mural?', 'Apagar', true)) { await call('posts.delete', {id:p.id}); toast('Recado apagado'); await reload(); }
+      } catch (err) { toast(err.message, 'err'); }
+    };
+    this.refresh();
+  },
+  refresh() {
+    const el = $('#muralList'); if (!el) return;
+    State.prefs.mural_seen = new Date().toISOString(); savePrefs();
+    el.innerHTML = State.posts.length ? State.posts.map(p => postHtml(p)).join('')
+      : `<div class="card">${emptyState('Mural vazio', 'Avisos, combinados da oficina, horários de reunião… tudo que a equipe inteira precisa saber.')}</div>`;
+    renderNav();
+  }});
+function openPost(p) {
+  const m = openModal({title:'Editar recado', size:'mid', body:`<div class="stack"><div class="field"><label>Título (opcional)</label><input class="input" id="epTitle" value="${esc(p.title || '')}" maxlength="120"></div>
+    <div class="field"><label>Recado</label><textarea class="input" id="epBody" rows="6" autofocus>${esc(p.body)}</textarea></div></div>`,
+    foot:`<span class="spacer"></span><button class="btn" data-close>Cancelar</button><button class="btn primary" id="epSave">Salvar</button>`});
+  m.q('#epSave').onclick = async () => {
+    try { await call('posts.save', {post:{id:p.id, title:m.q('#epTitle').value, body:m.q('#epBody').value}}); m.close(); toast('Recado atualizado', 'ok'); await reload(); }
+    catch (e) { toast(e.message, 'err'); }
+  };
+}
 
 // ═══════════ MÓDULO: TAREFAS ═══════════
 function TS() {
@@ -372,6 +482,7 @@ function filterTasks(f, board) {
   return State.tasks.filter(t => {
     if (f.item && t.item_id !== f.item) return false;
     if (f.user === '__me') { if (t.assignee_id !== me) return false; }
+    else if (f.user === '__help') { if (!helpsIn(t)) return false; }
     else if (f.user === '__none') { if (t.assignee_id) return false; }
     else if (f.user && t.assignee_id !== f.user) return false;
     if (f.prio && String(t.priority) !== String(f.prio)) return false;
@@ -395,7 +506,7 @@ function toolbarSelects() {
   if (f.user && !f.user.startsWith('__') && !userById(f.user)) f.user = '';
   return {
     item: opt('', 'Todos os itens', f.item) + State.items.map(i => opt(i.id, i.name, f.item)).join(''),
-    user: opt('', 'Todos os responsáveis', f.user) + opt('__me', '★ Minhas tarefas', f.user) + opt('__none', 'Sem responsável', f.user) + State.users.filter(u => u.active).map(u => opt(u.id, u.full_name, f.user)).join(''),
+    user: opt('', 'Todos os responsáveis', f.user) + opt('__me', '★ Minhas tarefas', f.user) + opt('__help', '☆ Em que eu ajudo', f.user) + opt('__none', 'Sem responsável', f.user) + State.users.filter(u => u.active).map(u => opt(u.id, u.full_name, f.user)).join(''),
     status: opt('open', 'Abertas', f.status) + opt('all', 'Todos os status', f.status) + opt('late', '⚠ Atrasadas', f.status) + opt('week', 'Vencem em 7 dias', f.status) + C.statuses.map(s => opt(s.id, s.label, f.status)).join(''),
     prio: opt('', 'Todas as prioridades', f.prio) + [...C.priorities].reverse().map(p => opt(p.id, p.label, f.prio)).join(''),
     group: [['none','Sem agrupamento'],['item','Agrupar por item'],['user','Agrupar por responsável'],['status','Agrupar por status'],['priority','Agrupar por prioridade']].map(([v, l]) => opt(v, l, f.group)).join(''),
@@ -403,10 +514,11 @@ function toolbarSelects() {
 }
 registerModule({id:'tasks', title:'Tarefas', icon:'tasks', section:'Trabalho',
   subtitle:() => 'Veja por item, por integrante — em lista, quadro ou calendário',
-  badge:() => { const mine = State.tasks.filter(t => t.assignee_id === State.me.id && t.status !== 'done'); const late = mine.filter(isLate).length; return {n:late || mine.length, hot:late > 0}; },
+  badge:() => { const mine = collapseRecur(State.tasks.filter(t => t.assignee_id === State.me.id && t.status !== 'done')).list; const late = mine.filter(isLate).length; return {n:late || mine.length, hot:late > 0}; },
   render(view, actions) {
     const f = TS(), o = toolbarSelects();
-    actions.innerHTML = `<button class="btn" id="expBtn" title="Abrir as tarefas filtradas no Excel">${icon('download')} Exportar</button>` + (can('tasks.create') ? `<button class="btn primary" id="newBtn" title="Atalho: N">${icon('plus')} Nova tarefa</button>` : '');
+    actions.innerHTML = (State.recurrences.length || can('tasks.create') ? `<button class="btn" id="recBtn" title="Tarefas que se repetem (reuniões etc.)">${icon('repeat')} Repetições</button>` : '')
+      + `<button class="btn" id="expBtn" title="Abrir as tarefas filtradas no Excel">${icon('download')} Exportar</button>` + (can('tasks.create') ? `<button class="btn primary" id="newBtn" title="Atalho: N">${icon('plus')} Nova tarefa</button>` : '');
     view.innerHTML = `<div class="toolbar">
       <div class="seg" id="viewSeg">${[['list','list','Lista'],['board','board','Quadro'],['cal','calendar','Calendário']].map(([v, ic, l]) => `<button data-v="${v}" class="${f.view === v ? 'on' : ''}">${icon(ic, 16)}${l}</button>`).join('')}</div>
       <div class="search">${icon('search', 16)}<input class="input" id="fQ" placeholder="Buscar…  ( / )" value="${esc(f.q)}"></div>
@@ -419,13 +531,16 @@ registerModule({id:'tasks', title:'Tarefas', icon:'tasks', section:'Trabalho',
     [['fItem','item'],['fUser','user'],['fStatus','status'],['fPrio','prio'],['fGroup','group']].forEach(([id, k]) => $('#' + id).onchange = e => { f[k] = e.target.value; savePrefs(); renderTasksBody(); });
     $('#fClear').onclick = () => { Object.assign(f, {q:'', item:'', user:'', status:'open', prio:'', group:'none'}); savePrefs(); go('tasks'); };
     if ($('#newBtn')) $('#newBtn').onclick = () => openTask(null);
+    if ($('#recBtn')) $('#recBtn').onclick = openSeriesList;
     $('#expBtn').onclick = () => {
       const list = sortTasks(filterTasks(f, f.view === 'board'));
       if (!list.length) return toast('Nenhuma tarefa para exportar com esses filtros.', 'err');
       const br = d => d ? fmtDate(d, true) : '';
       const cell = v => { const x = String(v ?? ''); return /[;"\n\r]/.test(x) ? `"${x.replace(/"/g, '""')}"` : x; };
-      const rows = [['Título','Item','Responsável','Prioridade','Status','Início','Prazo','Progresso (%)','Descrição','Criada por','Concluída em']]
-        .concat(list.map(t => [t.title, t.item_name, t.assignee_name, PRIO[t.priority].label, STATUS[t.status].label, br(t.start_date), br(t.due_date), t.progress, t.description, t.creator_name, t.completed_at ? br(t.completed_at.slice(0, 10)) : '']));
+      const names = ids => ids.map(id => (userById(id) || {}).full_name).filter(Boolean).join(', ');
+      const rows = [['Título','Item','Responsável','Apoio','Prioridade','Status','Início','Prazo','Horário','Progresso (%)','Etapas','Descrição','Criada por','Concluída em']]
+        .concat(list.map(t => [t.title, t.item_name, t.assignee_name, names(t.members || []), PRIO[t.priority].label, STATUS[t.status].label, br(t.start_date), br(t.due_date), t.due_time || '',
+          t.progress, t.sub_total ? `${t.sub_done}/${t.sub_total}` : '', t.description, t.creator_name, t.completed_at ? br(t.completed_at.slice(0, 10)) : '']));
       download(`tarefas_${todayISO()}.csv`, '\ufeff' + rows.map(r => r.map(cell).join(';')).join('\r\n'), 'text/csv;charset=utf-8');
       toast(`${plural(list.length, 'tarefa exportada', 'tarefas exportadas')} — abra o arquivo no Excel`, 'ok');
     };
@@ -438,8 +553,12 @@ registerModule({id:'tasks', title:'Tarefas', icon:'tasks', section:'Trabalho',
   }});
 function renderTasksBody() {
   const el = $('#tasksBody'); if (!el) return;
-  const f = TS(), list = filterTasks(f, f.view === 'board');
-  if (f.view === 'board') renderBoard(el, list); else if (f.view === 'cal') renderCalendar(el, list); else renderList(el, list);
+  const f = TS(), all = filterTasks(f, f.view === 'board');
+  if (f.view === 'cal') return renderCalendar(el, all);
+  const {list, hidden} = collapseRecur(all);
+  if (f.view === 'board') renderBoard(el, list); else renderList(el, list);
+  if (hidden) el.insertAdjacentHTML('beforeend', `<div class="foot-note">${icon('repeat', 13)} ${plural(hidden, 'ocorrência futura de repetições está oculta', 'ocorrências futuras de repetições estão ocultas')} — veja todas no <a data-tocal>Calendário</a>.</div>`);
+  const tc = $('[data-tocal]', el); if (tc) tc.onclick = () => { f.view = 'cal'; savePrefs(); go('tasks'); };
 }
 function groupOf(t, g) {
   if (g === 'item') return {key:t.item_id || '', label:t.item_name || 'Sem item', color:t.item_color || '#94a3b8', ord:t.item_id ? State.items.findIndex(i => i.id === t.item_id) : 9999};
@@ -462,8 +581,8 @@ function renderList(el, list) {
   const th = cols.map(([k, l]) => `<th data-sort="${k}">${l}${f.sortKey === k ? (f.sortDir > 0 ? ' ↑' : ' ↓') : ''}</th>`).join('');
   const row = t => `<tr class="trow ${t.status === 'done' ? 'done' : ''}" data-id="${t.id}">
     <td><button class="check ${t.status === 'done' ? 'on' : ''}" data-act="toggle" ${t.can_edit ? '' : 'disabled'} title="${t.status === 'done' ? 'Reabrir' : 'Marcar como concluída'}">${icon('check', 12)}</button></td>
-    <td><div class="t-title">${esc(t.title)}</div>${t.description ? `<div class="t-sub">${esc(t.description.slice(0, 160))}</div>` : ''}</td>
-    <td>${itemTag(t)}</td><td>${userCell(t.assignee_id)}</td>
+    <td><div class="t-title">${recurMark(t)}${esc(t.title)}${subChip(t)}</div>${t.description ? `<div class="t-sub">${esc(t.description.slice(0, 160))}</div>` : ''}</td>
+    <td>${itemTag(t)}</td><td><div class="row">${userCell(t.assignee_id)}${(t.members || []).length ? `<span class="plus-help" title="Apoio: ${esc((t.members || []).map(id => (userById(id) || {}).full_name).filter(Boolean).join(', '))}">+${t.members.length}</span>` : ''}</div></td>
     <td>${pill(PRIO[t.priority].label, PRIO[t.priority].color, t.can_edit ? 'prio' : '')}</td>
     <td>${pill(STATUS[t.status].label, STATUS[t.status].color, t.can_edit ? 'status' : '')}</td>
     <td>${dueHtml(t)}</td><td>${progressHtml(t.progress)}</td></tr>`;
@@ -480,9 +599,9 @@ function renderMobileList(el, groups, n) {
   const f = TS();
   const card = t => `<div class="mtask ${t.status === 'done' ? 'done' : ''}" data-id="${t.id}">
     <button class="check ${t.status === 'done' ? 'on' : ''}" data-act="toggle" ${t.can_edit ? '' : 'disabled'} title="Concluir">${icon('check', 12)}</button>
-    <div class="mt-main"><div class="t-title">${esc(t.title)}</div>
-      <div class="mt-meta">${t.item_id ? itemTag(t) : ''}${dueHtml(t)}</div>
-      <div class="mt-meta">${pill(STATUS[t.status].label, STATUS[t.status].color, t.can_edit ? 'status' : '')}${pill(PRIO[t.priority].label, PRIO[t.priority].color, t.can_edit ? 'prio' : '')}<span class="ml">${avatar(userById(t.assignee_id), 26)}</span></div></div></div>`;
+    <div class="mt-main"><div class="t-title">${recurMark(t)}${esc(t.title)}</div>
+      <div class="mt-meta">${t.item_id ? itemTag(t) : ''}${dueHtml(t)}${subChip(t)}</div>
+      <div class="mt-meta">${pill(STATUS[t.status].label, STATUS[t.status].color, t.can_edit ? 'status' : '')}${pill(PRIO[t.priority].label, PRIO[t.priority].color, t.can_edit ? 'prio' : '')}<span class="ml">${avatarStack(peopleOf(t), 26, 3)}</span></div></div></div>`;
   let html = '';
   for (const g of groups) {
     if (f.group !== 'none') html += `<div class="mgroup"><span class="gdot" style="--c:${g.color}"></span>${esc(g.label)}<span class="gcount">${g.tasks.length}</span></div>`;
@@ -529,8 +648,8 @@ function enableDnD(root, itemSel, zoneSel, onDrop) {
 function renderBoard(el, list) {
   const cardHtml = t => `<div class="ktask ${t.status === 'done' ? 'done' : ''}" draggable="${t.can_edit}" data-id="${t.id}" style="--c:${PRIO[t.priority].color}">
       <div class="kt-top">${t.item_id ? itemTag(t) : '<span></span>'}${pill(PRIO[t.priority].label, PRIO[t.priority].color)}</div>
-      <div class="kt-title">${esc(t.title)}</div>
-      <div class="kt-foot">${dueHtml(t)}${t.progress && t.status !== 'done' ? `<div class="progress sm"><i style="width:${t.progress}%"></i></div>` : ''}<span class="ml">${avatar(userById(t.assignee_id), 26)}</span></div></div>`;
+      <div class="kt-title">${recurMark(t)}${esc(t.title)}</div>
+      <div class="kt-foot">${dueHtml(t)}${subChip(t) || (t.progress && t.status !== 'done' ? `<div class="progress sm"><i style="width:${t.progress}%"></i></div>` : '')}<span class="ml">${avatarStack(peopleOf(t), 24, 3)}</span></div></div>`;
   el.innerHTML = `<div class="board">${C.statuses.map(s => {
     let ts = list.filter(t => t.status === s.id), extra = 0;
     if (s.id === 'done') { ts.sort((a, b) => (b.completed_at || '').localeCompare(a.completed_at || '')); if (ts.length > 25) { extra = ts.length - 25; ts = ts.slice(0, 25); } }
@@ -548,7 +667,7 @@ function renderAgenda(el, list) {
   const [y, m] = f.month.split('-').map(Number), today = todayISO();
   const byDate = {}; for (const t of list) if (t.due_date && t.due_date.slice(0, 7) === f.month) (byDate[t.due_date] ||= []).push(t);
   const days = Object.keys(byDate).sort(), noDue = list.filter(t => !t.due_date).length;
-  const row = t => `<div class="mtask ${t.status === 'done' ? 'done' : ''}" data-id="${t.id}"><span class="sdot" style="--c:${PRIO[t.priority].color}"></span><div class="mt-main"><div class="t-title">${esc(t.title)}</div><div class="mt-meta">${t.item_id ? itemTag(t) : ''}${pill(STATUS[t.status].label, STATUS[t.status].color)}<span class="ml">${avatar(userById(t.assignee_id), 24)}</span></div></div></div>`;
+  const row = t => `<div class="mtask ${t.status === 'done' ? 'done' : ''}" data-id="${t.id}"><span class="sdot" style="--c:${PRIO[t.priority].color}"></span><div class="mt-main"><div class="t-title">${recurMark(t)}${t.due_time ? `<span class="time-tag">${t.due_time}</span>` : ''}${esc(t.title)}</div><div class="mt-meta">${t.item_id ? itemTag(t) : ''}${pill(STATUS[t.status].label, STATUS[t.status].color)}${subChip(t)}<span class="ml">${avatarStack(peopleOf(t), 24, 3)}</span></div></div></div>`;
   const dayHtml = d => { const dd = parseISO(d);
     return `<div class="agenda-day ${d === today ? 'today' : ''} ${d < today ? 'past' : ''}"><div class="ad-head"><b>${dd.getDate()}</b><span>${cap(WEEKDAYS[dd.getDay()])}${d === today ? ' · hoje' : ''}</span>${can('tasks.create') ? `<button class="add-day" data-add="${d}" title="Nova tarefa neste dia">${icon('plus', 14)}</button>` : ''}</div>${byDate[d].sort((a, b) => (a.status === 'done') - (b.status === 'done') || b.priority - a.priority).map(row).join('')}</div>`; };
   el.innerHTML = `<div class="agenda"><div class="cal-head"><button class="btn icon" data-nav="-1">${icon('chevL')}</button><h2 class="agenda-title">${cap(new Date(y, m - 1, 1).toLocaleDateString('pt-BR', {month:'long'}))} ${y}</h2><button class="btn icon" data-nav="1">${icon('chevR')}</button><button class="btn" data-nav="0">Hoje</button></div>
@@ -571,7 +690,7 @@ function renderCalendar(el, list) {
   const byDate = {}; for (const t of list) if (t.due_date) (byDate[t.due_date] ||= []).push(t);
   const noDue = list.filter(t => !t.due_date).length, today = todayISO();
   const colorOf = t => f.calColor === 'item' ? (t.item_color || '#94a3b8') : f.calColor === 'status' ? STATUS[t.status].color : PRIO[t.priority].color;
-  const chip = t => `<div class="chip ${t.status === 'done' ? 'done' : ''} ${isLate(t) ? 'late' : ''}" draggable="${t.can_edit}" data-id="${t.id}" style="--c:${colorOf(t)}" title="${esc(t.title)} — ${esc(t.assignee_name || 'sem responsável')} · ${STATUS[t.status].label}">${t.assignee_id ? `<span class="ini">${esc(initials(t.assignee_name))}</span>` : ''}${esc(t.title)}</div>`;
+  const chip = t => `<div class="chip ${t.status === 'done' ? 'done' : ''} ${isLate(t) ? 'late' : ''}" draggable="${t.can_edit}" data-id="${t.id}" style="--c:${colorOf(t)}" title="${esc(t.title)} — ${esc(t.assignee_name || 'sem responsável')} · ${STATUS[t.status].label}">${t.due_time ? `<span class="ini">${t.due_time}</span>` : t.assignee_id ? `<span class="ini">${esc(initials(t.assignee_name))}</span>` : ''}${esc(t.title)}</div>`;
   let cells = '';
   for (let i = 0; i < weeks * 7; i++) {
     const d = new Date(start); d.setDate(start.getDate() + i);
@@ -605,49 +724,163 @@ function renderCalendar(el, list) {
 }
 
 // ───────── janela da tarefa ─────────
-async function openTask(id, defaults = {}) {
-  let t, comments = [], activity = [];
+// Abre uma tarefa existente (id), uma nova (id = null) ou o modelo de uma repetição (series).
+async function openTask(id, defaults = {}, series = null) {
+  let t, comments = [], activity = [], subs = [];
   if (id) {
-    try { const d = await call('tasks.get', {id}); t = d.task; comments = d.comments; activity = d.activity; }
+    try { const d = await call('tasks.get', {id}); t = d.task; comments = d.comments; activity = d.activity; subs = d.subtasks || []; }
     catch (e) { toast(e.message, 'err'); return; }
+  } else if (series) {
+    t = {id:null, title:series.title, description:series.description || '', item_id:series.item_id || '', assignee_id:series.assignee_id || '', members:[...series.members],
+         priority:series.priority, status:'todo', start_date:'', due_date:series.start_date, due_time:series.due_time || '', progress:0, can_edit:series.can_edit, can_delete:false};
+    subs = series.subtasks.map(x => ({...x}));
   } else {
     if (!can('tasks.create')) return toast('Você não tem permissão para criar tarefas.', 'err');
     const f = TS(), fu = f.user && !f.user.startsWith('__') ? f.user : null;
-    t = {id:null, title:'', description:'', item_id:f.item || State.me.item_id || '', assignee_id:can('tasks.assign') ? (fu || State.me.id) : State.me.id,
-         priority:2, status:'todo', start_date:'', due_date:'', progress:0, can_edit:true, can_delete:false, ...defaults};
+    t = {id:null, title:'', description:'', item_id:f.item || State.me.item_id || '', assignee_id:can('tasks.assign') ? (fu || State.me.id) : State.me.id, members:[],
+         priority:2, status:'todo', start_date:'', due_date:'', due_time:'', progress:0, can_edit:true, can_delete:false, ...defaults};
   }
+  const live = !!id;                       // etapas gravadas na hora (tarefa existente)
   const ro = !t.can_edit, dis = ro ? 'disabled' : '';
   const canAssign = can('tasks.assign') && !ro;
   const users = State.users.filter(u => u.active || u.id === t.assignee_id);
-  let prio = t.priority, status = t.status;
-  const main = `${ro ? `<div class="readonly-note">${icon('lock', 16)} Somente leitura — você pode comentar.</div>` : ''}
+  const activeUsers = State.users.filter(u => u.active);
+  let prio = t.priority, status = t.status, members = [...(t.members || [])];
+  const rep = series ? {freq:series.freq, every:series.every, weekdays:[...series.weekdays], end_date:series.end_date || ''}
+    : {freq:defaults.repeat || '', every:1, weekdays:[], end_date:''};
+  const canRepeat = !id;                   // repetição se define ao criar (ou editando a série)
+  const parent = t.recur_id ? seriesById(t.recur_id) : null;
+  const banner = t.recur_id ? `<div class="recur-banner">${icon('repeat', 16)}<span>${parent ? `Faz parte de uma repetição: <b>${esc(freqText(parent))}</b>` : 'Esta tarefa veio de uma repetição que já foi encerrada.'}</span>${parent && parent.can_edit ? '<a id="tEditSeries">Editar repetição</a>' : ''}</div>` : '';
+  const repeatHtml = canRepeat ? `<div class="field span2 repeat-box"><label>${icon('repeat', 13)} Repetir</label>
+      <div class="row wrap"><select class="input" id="rFreq" ${dis} style="max-width:190px">${series ? '' : opt('', 'Não repete', rep.freq)}${opt('daily', 'Diariamente', rep.freq)}${opt('weekly', 'Semanalmente', rep.freq)}${opt('monthly', 'Mensalmente', rep.freq)}</select>
+        <span class="rp-more row"><span class="muted sm">a cada</span><input class="input" type="number" min="1" max="12" id="rEvery" value="${rep.every}" style="width:70px" ${dis}><span class="muted sm" id="rUnit"></span></span></div>
+      <div class="rp-more rp-week choice wd-choice" id="rDays">${WD_SHORT.map((w, i) => `<button type="button" data-d="${i}" style="--c:var(--accent)" class="${rep.weekdays.includes(i) ? 'on' : ''}" ${dis}>${w}</button>`).join('')}</div>
+      <div class="rp-more row wrap"><span class="muted sm">Termina em</span><input type="date" class="input" id="rEnd" value="${rep.end_date}" style="max-width:180px" ${dis}><span class="hint" style="margin:0">vazio = sem fim · as próximas 8 semanas ficam sempre visíveis</span></div></div>` : '';
+  const main = `${ro ? `<div class="readonly-note">${icon('lock', 16)} Somente leitura — você pode comentar${subs.some(s => s.assignee_id === State.me.id) ? ' e marcar as suas etapas' : ''}.</div>` : ''}${banner}
     <input class="title-input" id="tTitle" placeholder="O que precisa ser feito?" value="${esc(t.title)}" ${dis} ${id ? '' : 'autofocus'}>
     <div class="tm-grid">
       <div class="field"><label>${icon('layers', 13)} Item / subsistema</label><select class="input" id="tItem" ${dis}>${opt('', '— Sem item —', t.item_id)}${State.items.map(i => opt(i.id, i.name, t.item_id)).join('')}</select></div>
-      <div class="field"><label>${icon('users', 13)} Responsável</label><select class="input" id="tAssignee" ${canAssign ? '' : 'disabled'}>${opt('', '— Sem responsável —', t.assignee_id)}${users.map(u => opt(u.id, u.full_name, t.assignee_id)).join('')}</select>${!can('tasks.assign') && !ro ? '<div class="hint">Seu cargo só permite tarefas para você mesmo.</div>' : ''}</div>
+      <div class="field"><label>${icon('users', 13)} Responsável principal</label><select class="input" id="tAssignee" ${canAssign ? '' : 'disabled'}>${opt('', '— Sem responsável —', t.assignee_id)}${users.map(u => opt(u.id, u.full_name, t.assignee_id)).join('')}</select>${!can('tasks.assign') && !ro ? '<div class="hint">Seu cargo só permite tarefas para você mesmo.</div>' : ''}</div>
+      <div class="field span2"><label>${icon('users', 13)} Apoio</label><div class="mpick" id="tMembers"></div></div>
       <div class="field span2"><label>${icon('flag', 13)} Prioridade</label><div class="choice" id="tPrio">${C.priorities.map(p => `<button type="button" data-v="${p.id}" style="--c:${p.color}" class="${p.id == prio ? 'on' : ''}" ${dis}>${p.label}</button>`).join('')}</div></div>
-      <div class="field span2"><label>${icon('refresh', 13)} Status</label><div class="choice" id="tStatus">${C.statuses.map(s => `<button type="button" data-v="${s.id}" style="--c:${s.color}" class="${s.id === status ? 'on' : ''}" ${dis}>${s.label}</button>`).join('')}</div></div>
-      <div class="field"><label>${icon('calendar', 13)} Início</label><input type="date" class="input" id="tStart" value="${t.start_date || ''}" ${dis}></div>
-      <div class="field"><label>${icon('clock', 13)} Prazo</label><input type="date" class="input" id="tDue" value="${t.due_date || ''}" ${dis}></div>
-      <div class="field span2"><label>Progresso · <span id="tProgVal" style="color:var(--accent)">${t.progress}%</span></label><input type="range" min="0" max="100" step="5" id="tProg" value="${t.progress}" ${dis}></div>
+      <div class="field span2 no-rep"><label>${icon('refresh', 13)} Status</label><div class="choice" id="tStatus">${C.statuses.map(s => `<button type="button" data-v="${s.id}" style="--c:${s.color}" class="${s.id === status ? 'on' : ''}" ${dis}>${s.label}</button>`).join('')}</div></div>
+      <div class="field no-rep"><label>${icon('calendar', 13)} Início</label><input type="date" class="input" id="tStart" value="${t.start_date || ''}" ${dis}></div>
+      <div class="field"><label>${icon('clock', 13)} <span id="tDueLbl">Prazo</span></label><div class="row"><input type="date" class="input" id="tDue" value="${t.due_date || ''}" ${dis}><input type="time" class="input" id="tTime" value="${t.due_time || ''}" title="Horário (opcional)" style="max-width:120px" ${dis}></div></div>
+      ${repeatHtml}
+      <div class="field span2 no-rep"><label>Progresso · <span id="tProgVal" style="color:var(--accent)">${t.progress}%</span><span class="muted" id="tProgHint" style="text-transform:none;letter-spacing:0;font-weight:600"></span></label><input type="range" min="0" max="100" step="5" id="tProg" value="${t.progress}" ${dis}></div>
     </div>
-    <div class="field"><label>Descrição</label><textarea class="input" id="tDesc" rows="5" placeholder="Detalhes, links, peças, medidas, referências…" ${dis}>${esc(t.description)}</textarea></div>`;
+    <div class="subs"><div class="subs-head">${icon('checklist', 15)}<b>Etapas</b><span class="muted sm" id="subCount"></span></div><div id="subList"></div>
+      ${!ro ? `<div class="sub-add"><input class="input" id="subNew" placeholder="Adicionar etapa… (Enter)" maxlength="200"><select class="input" id="subWho" title="Responsável pela etapa">${opt('', 'Sem responsável', '')}${activeUsers.map(u => opt(u.id, shortName(u.full_name), '')).join('')}</select><button class="btn" id="subAddBtn" type="button">${icon('plus', 16)}</button></div>` : ''}</div>
+    <div class="field"><label>Descrição</label><textarea class="input" id="tDesc" rows="4" placeholder="Detalhes, links, peças, medidas, referências…" ${dis}>${esc(t.description)}</textarea></div>`;
   const side = id ? `<div class="side"><div class="seg sm" id="sideTabs"><button data-t="c" class="on">${icon('chat', 14)} <span>Comentários (<span id="cCount">${comments.length}</span>)</span></button><button data-t="a">${icon('history', 14)} Histórico</button></div>
       <div class="side-list" id="sideC"></div><div class="side-list" id="sideA" hidden>${activity.map(a => `<div class="act"><span>${avatar(userById(a.user_id) || {id:a.user_id || 'x', full_name:a.user_name || '?'}, 22)}</span><span><b>${esc(shortName(a.user_name || '?'))}</b> · ${esc(a.detail)}</span><span class="when" title="${fmtDateTime(a.created_at)}">${timeAgo(a.created_at)}</span></div>`).join('') || '<p class="muted">Sem histórico.</p>'}</div>
       <div id="cBox"><textarea class="input" id="cText" rows="2" style="min-height:62px" placeholder="Escreva um comentário… (Ctrl+Enter envia)"></textarea><div class="row" style="margin-top:8px"><span class="meta-line">Criada por ${esc(t.creator_name || '—')} em ${fmtDateTime(t.created_at)}</span><button class="btn primary ml" id="cSend" style="height:32px">${icon('send', 15)} Enviar</button></div></div></div>` : '';
-  const foot = `${id && t.can_delete ? `<button class="btn danger" id="tDel">${icon('trash', 16)} Excluir</button>` : ''}<span class="spacer"></span>
-    ${ro ? '<button class="btn" data-close>Fechar</button>' : `<span class="muted sm">Ctrl+Enter salva</span><button class="btn" data-close>Cancelar</button><button class="btn primary" id="tSave">${icon('check', 16)} ${id ? 'Salvar' : 'Criar tarefa'}</button>`}`;
-  const m = openModal({title:id ? 'Tarefa' : 'Nova tarefa', size:id ? 'wide' : 'mid', backdrop:false, body:`<div class="task-layout ${id ? '' : 'single'}"><div>${main}</div>${side}</div>`, foot});
+  const foot = `${id && t.can_delete ? `<button class="btn danger" id="tDel">${icon('trash', 16)} Excluir</button>` : ''}${series && series.can_edit ? `<button class="btn danger" id="tStop">${icon('x', 16)} Encerrar repetição</button>` : ''}<span class="spacer"></span>
+    ${ro ? '<button class="btn" data-close>Fechar</button>' : `<span class="muted sm">Ctrl+Enter salva</span><button class="btn" data-close>Cancelar</button><button class="btn primary" id="tSave">${icon('check', 16)} ${id || series ? 'Salvar' : 'Criar tarefa'}</button>`}`;
+  const m = openModal({title:series ? 'Repetição' : id ? 'Tarefa' : 'Nova tarefa', size:id ? 'wide' : 'mid', backdrop:false, body:`<div class="task-layout ${id ? '' : 'single'}"><div>${main}</div>${side}</div>`, foot});
   const q = m.q;
+  const repeating = () => canRepeat && !!q('#rFreq').value;
+
+  // ── apoio ──
+  function renderMembers() {
+    const assignee = q('#tAssignee').value;
+    members = members.filter(x => x !== assignee);
+    const chips = members.map(uid => { const u = userById(uid); if (!u) return '';
+      return `<span class="mchip">${avatar(u, 22)}${esc(shortName(u.full_name))}${canAssign || (uid === State.me.id && !ro) ? `<button type="button" data-rm="${uid}" title="Tirar do apoio">${icon('x', 13)}</button>` : ''}</span>`; }).join('');
+    let add = '';
+    if (canAssign) {
+      const avail = activeUsers.filter(u => u.id !== assignee && !members.includes(u.id));
+      add = avail.length ? `<select class="input mini" id="mAdd"><option value="">+ Adicionar pessoa</option>${avail.map(u => opt(u.id, u.full_name, '')).join('')}</select>` : '';
+    } else if (!ro && assignee !== State.me.id && !members.includes(State.me.id)) add = `<button type="button" class="btn sm-btn" id="mMe">${icon('plus', 14)} Quero ajudar</button>`;
+    q('#tMembers').innerHTML = (chips + add) || '<span class="muted sm">Ninguém no apoio.</span>';
+    if (q('#mAdd')) q('#mAdd').onchange = e => { if (e.target.value) { members.push(e.target.value); renderMembers(); } };
+    if (q('#mMe')) q('#mMe').onclick = () => { members.push(State.me.id); renderMembers(); };
+    $$('[data-rm]', q('#tMembers')).forEach(b => b.onclick = () => { members = members.filter(x => x !== b.dataset.rm); renderMembers(); });
+  }
+  q('#tAssignee').onchange = renderMembers;
+  renderMembers();
+
+  // ── etapas ──
+  const canToggle = st => live && (!ro || st.assignee_id === State.me.id);
+  function setProgress(p) { q('#tProg').value = p; q('#tProgVal').textContent = p + '%'; }
+  function renderSubs() {
+    const done = subs.filter(s => s.done).length;
+    q('#subCount').textContent = subs.length ? (live ? `${done} de ${subs.length} concluídas` : plural(subs.length, 'etapa', 'etapas')) : '';
+    q('#subList').innerHTML = subs.length ? subs.map((st, i) => { const u = userById(st.assignee_id);
+      return `<div class="sub-row ${st.done ? 'done' : ''}" data-i="${i}">${live ? `<button type="button" class="check ${st.done ? 'on' : ''}" data-sact="toggle" ${canToggle(st) ? '' : 'disabled'} title="${st.done ? 'Reabrir etapa' : 'Concluir etapa'}">${icon('check', 12)}</button>` : `<span class="sub-dot"></span>`}
+        <span class="sub-title">${esc(st.title)}</span>${u ? `<span class="sub-who" title="${esc(u.full_name)}">${avatar(u, 22)}<span>${esc(shortName(u.full_name))}</span></span>` : ''}
+        ${!ro ? `<button type="button" class="btn ghost icon sub-del" data-sact="del" title="Remover etapa">${icon('x', 14)}</button>` : ''}</div>`; }).join('')
+      : `<p class="muted sm" style="margin:2px 0 6px">${ro ? 'Sem etapas.' : 'Divida a tarefa em etapas: cada etapa concluída soma no progresso.'}</p>`;
+    const auto = subs.length > 0;
+    q('#tProg').disabled = ro || auto;
+    q('#tProgHint').textContent = auto ? ' · calculado pelas etapas' : '';
+    if (auto && !live) setProgress(status === 'done' ? 100 : 0);
+  }
+  async function subCall(name, payload) {
+    try {
+      const r = await call(name, payload);
+      subs = r.subtasks; t.updated_at = r.task.updated_at; setProgress(r.task.progress);
+      State.refreshPending = true; renderSubs();
+    } catch (e) { toast(e.message, 'err'); }
+  }
+  q('#subList').onclick = e => {
+    const b = e.target.closest('[data-sact]'); if (!b) return;
+    const i = +b.closest('[data-i]').dataset.i, st = subs[i];
+    if (b.dataset.sact === 'toggle') return subCall('subtasks.update', {id:st.id, changes:{done:!st.done}});
+    if (b.dataset.sact === 'del') { if (live) return subCall('subtasks.delete', {id:st.id}); subs.splice(i, 1); renderSubs(); }
+  };
+  const addSub = () => {
+    const title = q('#subNew').value.trim(); if (!title) return q('#subNew').focus();
+    const who = q('#subWho').value || null;
+    q('#subNew').value = ''; q('#subNew').focus();
+    if (live) return subCall('subtasks.add', {task_id:t.id, title, assignee_id:who});
+    subs.push({title, assignee_id:who}); renderSubs();
+  };
+  if (q('#subAddBtn')) { q('#subAddBtn').onclick = addSub; q('#subNew').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.ctrlKey) { e.preventDefault(); addSub(); } }); }
+  renderSubs();
+
+  // ── repetição ──
+  function syncRepeat() {
+    const on = repeating(), f = canRepeat ? q('#rFreq').value : '';
+    $$('.no-rep', m.el).forEach(el => el.hidden = on);
+    q('#tDueLbl').textContent = on ? 'Primeira data' : 'Prazo';
+    if (!canRepeat) return;
+    $$('.rp-more', m.el).forEach(el => el.hidden = !on);
+    q('.rp-week').hidden = f !== 'weekly';
+    const n = +q('#rEvery').value || 1;
+    q('#rUnit').textContent = {daily:n > 1 ? 'dias' : 'dia', weekly:n > 1 ? 'semanas' : 'semana', monthly:n > 1 ? 'meses' : 'mês'}[f] || '';
+    if (on && !q('#tDue').value) q('#tDue').value = todayISO();
+  }
+  if (canRepeat) {
+    q('#rFreq').onchange = syncRepeat; q('#rEvery').oninput = syncRepeat;
+    $$('#rDays button', m.el).forEach(b => b.onclick = () => b.classList.toggle('on'));
+  }
+  syncRepeat();
+  if (q('#tEditSeries')) q('#tEditSeries').onclick = () => { m.close(); openTask(null, {}, parent); };
+
   $$('#tPrio button', m.el).forEach(b => b.onclick = () => { prio = +b.dataset.v; $$('#tPrio button', m.el).forEach(x => x.classList.toggle('on', x === b)); });
-  $$('#tStatus button', m.el).forEach(b => b.onclick = () => { status = b.dataset.v; $$('#tStatus button', m.el).forEach(x => x.classList.toggle('on', x === b)); if (status === 'done') { q('#tProg').value = 100; q('#tProgVal').textContent = '100%'; } });
+  $$('#tStatus button', m.el).forEach(b => b.onclick = () => {
+    status = b.dataset.v; $$('#tStatus button', m.el).forEach(x => x.classList.toggle('on', x === b));
+    if (status === 'done') setProgress(100);
+    else if (subs.length) setProgress(live ? Math.round(subs.filter(s => s.done).length / subs.length * 100) : 0);
+  });
   q('#tProg').oninput = () => q('#tProgVal').textContent = q('#tProg').value + '%';
   const save = async (force = false) => {
-    const payload = {id:t.id, title:q('#tTitle').value, item_id:q('#tItem').value || null, assignee_id:q('#tAssignee').value || null, priority:prio, status,
-      start_date:q('#tStart').value || null, due_date:q('#tDue').value || null, progress:+q('#tProg').value, description:q('#tDesc').value};
-    if (!payload.title.trim()) { q('#tTitle').focus(); return toast('Dê um título para a tarefa.', 'err'); }
+    const title = q('#tTitle').value;
+    if (!title.trim()) { q('#tTitle').focus(); return toast('Dê um título para a tarefa.', 'err'); }
+    const common = {title, item_id:q('#tItem').value || null, assignee_id:q('#tAssignee').value || null, members, priority:prio,
+      due_time:q('#tTime').value || null, description:q('#tDesc').value};
     const b = q('#tSave'); b.disabled = true;
     try {
+      if (repeating()) {
+        if (!q('#tDue').value) { b.disabled = false; q('#tDue').focus(); return toast('Escolha a data da primeira ocorrência.', 'err'); }
+        const r = await call('recur.save', {series:{...common, id:series ? series.id : null, subtasks:subs.map(s => ({title:s.title, assignee_id:s.assignee_id})),
+          freq:q('#rFreq').value, every:+q('#rEvery').value || 1, weekdays:$$('#rDays button.on', m.el).map(x => +x.dataset.d),
+          start_date:q('#tDue').value, end_date:q('#rEnd').value || null}});
+        m.close(); toast(series ? 'Repetição atualizada' : `Repetição criada — ${plural(r.created, 'tarefa', 'tarefas')} no calendário 🔁`, 'ok'); await reload(); return;
+      }
+      const payload = {...common, id:t.id, status, start_date:q('#tStart').value || null, due_date:q('#tDue').value || null, progress:+q('#tProg').value};
+      if (!id) payload.subtasks = subs;
       await call('tasks.save', {task:payload, expected_updated_at:t.updated_at, force});
       m.close(); toast(id ? 'Tarefa salva' : 'Tarefa criada ✨', 'ok'); await reload();
     } catch (e) {
@@ -659,8 +892,13 @@ async function openTask(id, defaults = {}) {
   if (q('#tSave')) q('#tSave').onclick = () => save();
   m.el.addEventListener('keydown', e => { if (e.key === 'Enter' && e.ctrlKey && e.target.id !== 'cText' && q('#tSave')) { e.preventDefault(); save(); } });
   if (q('#tDel')) q('#tDel').onclick = async () => {
-    if (!await confirmDlg(`Excluir a tarefa “${t.title}”?`, 'Excluir', true)) return;
+    if (!await confirmDlg(`Excluir a tarefa “${t.title}”?${t.recur_id ? ' (Só esta ocorrência; a repetição continua.)' : ''}`, 'Excluir', true)) return;
     try { await call('tasks.delete', {id:t.id}); m.close(); toast('Tarefa excluída'); await reload(); } catch (e) { toast(e.message, 'err'); }
+  };
+  if (q('#tStop')) q('#tStop').onclick = async () => {
+    if (!await confirmDlg(`Encerrar a repetição “${series.title}”? As próximas ocorrências que ninguém mexeu serão removidas; as passadas e as já editadas ficam.`, 'Encerrar', true)) return;
+    try { const r = await call('recur.stop', {id:series.id}); m.close(); toast(`Repetição encerrada${r.removed ? ` — ${plural(r.removed, 'ocorrência futura removida', 'ocorrências futuras removidas')}` : ''}`); await reload(); }
+    catch (e) { toast(e.message, 'err'); }
   };
   if (id) {
     const renderComments = () => {
@@ -680,6 +918,21 @@ async function openTask(id, defaults = {}) {
   }
 }
 
+// Lista das repetições (reuniões ordinárias, revisões semanais…)
+function openSeriesList() {
+  const today = todayISO();
+  const nextOf = r => State.tasks.filter(t => t.recur_id === r.id && t.status !== 'done' && t.due_date >= today).map(t => t.due_date).sort()[0];
+  const rows = State.recurrences.map(r => { const nx = nextOf(r);
+    return `<div class="series-row" data-sid="${r.id}"><div class="sico">${icon('repeat', 18)}</div><div class="mt-main"><div class="t-title">${esc(r.title)}</div>
+      <div class="mt-meta"><span class="muted sm">${esc(freqText(r))}</span>${nx ? `<span class="sm">· próxima: <b>${fmtDate(nx)}</b></span>` : ''}</div></div>
+      ${avatarStack([r.assignee_id, ...r.members].filter(Boolean), 24, 3)}${r.can_edit ? `<button class="btn ghost icon" data-sedit="${r.id}" title="Editar">${icon('edit', 16)}</button>` : ''}</div>`; }).join('');
+  const m = openModal({title:'Repetições', size:'mid', body:rows ? `<div class="stack" style="gap:8px">${rows}</div><p class="hint">Cada repetição cria tarefas normais no calendário, sempre 8 semanas à frente. Marque cada ocorrência como concluída quando acontecer.</p>`
+      : emptyState('Nenhuma repetição', 'Use para reuniões ordinárias, revisões semanais, checagens do carro… Crie uma tarefa e escolha “Repetir”.'),
+    foot:`<span class="spacer"></span><button class="btn" data-close>Fechar</button>${can('tasks.create') ? `<button class="btn primary" id="sNew">${icon('plus', 16)} Nova repetição</button>` : ''}`});
+  $$('[data-sedit]', m.el).forEach(b => b.onclick = () => { m.close(); openTask(null, {}, seriesById(b.dataset.sedit)); });
+  if (m.q('#sNew')) m.q('#sNew').onclick = () => { m.close(); openTask(null, {repeat:'weekly'}); };
+}
+
 // ═══════════ MÓDULO: ITENS ═══════════
 const SWATCHES = ['#ef4444','#f97316','#f59e0b','#eab308','#84cc16','#22c55e','#10b981','#14b8a6','#0ea5e9','#3b82f6','#6366f1','#8b5cf6','#a855f7','#ec4899','#64748b','#78716c'];
 function swatchPicker(id, val) { return `<div class="swatches" id="${id}">${SWATCHES.map(c => `<button type="button" class="sw ${c === val ? 'on' : ''}" data-c="${c}" style="--c:${c}"></button>`).join('')}</div>`; }
@@ -691,10 +944,11 @@ registerModule({id:'items', title:'Itens', icon:'layers', section:'Trabalho', su
     view.innerHTML = `<div class="grid-cards">${State.items.map(i => {
       const ts = State.tasks.filter(t => t.item_id === i.id), open = ts.filter(t => t.status !== 'done'), late = open.filter(isLate).length;
       const pct = ts.length ? Math.round((ts.length - open.length) / ts.length * 100) : 0, leader = userById(i.leader_id);
+      const crew = State.users.filter(u => u.active && userItems(u).includes(i.id));
       return `<div class="card icard" style="--c:${i.color}"><div class="band"></div><div class="ib">
         <h3><span class="sq" style="width:11px;height:11px;border-radius:4px;background:${i.color}"></span>${esc(i.name)}</h3>
         ${i.description ? `<p>${esc(i.description)}</p>` : ''}
-        <div class="row">${leader ? `${avatar(leader, 26)}<span class="sm"><span class="muted">Líder:</span> <b>${esc(shortName(leader.full_name))}</b></span>` : '<span class="muted sm">Sem líder definido</span>'}</div>
+        <div class="row">${leader ? `${avatar(leader, 26)}<span class="sm"><span class="muted">Líder:</span> <b>${esc(shortName(leader.full_name))}</b></span>` : '<span class="muted sm">Sem líder definido</span>'}${crew.length ? `<span class="ml row" title="${esc(crew.map(u => u.full_name).join(', '))}">${avatarStack(crew.map(u => u.id), 22, 4)}</span>` : ''}</div>
         <div class="nums"><div><b>${open.length}</b><span>abertas</span></div><div><b class="${late ? 'red' : ''}">${late}</b><span>atrasadas</span></div><div><b>${ts.length - open.length}</b><span>concluídas</span></div></div>
         <div class="row"><div class="progress" style="flex:1;width:auto"><i style="width:${pct}%;background:${i.color}"></i></div><span class="sm muted" style="font-weight:700">${pct}%</span></div></div>
         <div class="if"><button class="btn" data-see="${i.id}">${icon('tasks', 16)} Ver tarefas</button>${can('items.manage') ? `<button class="btn ghost icon ml" data-edit="${i.id}" title="Editar">${icon('edit', 16)}</button>` : ''}</div></div>`;
@@ -725,12 +979,35 @@ function openItem(it) {
 
 // ═══════════ MÓDULO: EQUIPE ═══════════
 const canManageUser = u => can('users.manage') && (isAdmin() || ((u.role_level || 0) < State.level && u.id !== State.me.id));
+const userItems = u => [u.item_id, u.item2_id, u.item3_id].filter(Boolean);
+function userItemTags(u, small) {
+  return userItems(u).map((id, k) => { const it = itemById(id); if (!it) return '';
+    return `<span class="item-tag ${small ? 'sm' : ''} ${k ? 'sec' : ''}" style="--c:${it.color}" title="${k === 0 ? 'Item principal' : k === 1 ? 'Item secundário' : 'Item terciário'}"><span class="sq"></span>${esc(it.name)}</span>`; }).join('');
+}
+function captainCard() {
+  const cap_ = State.users.find(u => u.active && u.badge === 'captain'), vice = State.users.find(u => u.active && u.badge === 'vice');
+  if (!cap_ && !vice && !can('team.captain')) return '';
+  const who = (u, b) => u ? `<div class="capt-who">${avatar(u, 40)}<div><span class="capt" style="--c:${BADGES[b].color}">${icon('crown', 13)}${BADGES[b].label}</span><b>${esc(u.full_name)}</b></div></div>`
+    : `<div class="capt-who empty-capt"><div class="avatar ghost-av" style="width:40px;height:40px">?</div><div><span class="muted sm">${BADGES[b].label}</span><b class="muted">Não definido</b></div></div>`;
+  return `<div class="card capt-card">${who(cap_, 'captain')}${who(vice, 'vice')}${can('team.captain') ? `<button class="btn ml" id="capBtn">${icon('crown', 16)} Nomear</button>` : ''}</div>`;
+}
+function openCaptain() {
+  const act = State.users.filter(u => u.active), cur = b => (act.find(u => u.badge === b) || {}).id || '';
+  const m = openModal({title:'Capitão e vice-capitão', body:`<div class="stack"><p class="muted" style="margin:0;line-height:1.5">É um título de destaque: aparece no perfil, na equipe e no organograma. As permissões continuam vindo do cargo.</p>
+    <div class="field"><label>${icon('crown', 13)} Capitão</label><select class="input" id="cCap">${opt('', '— Ninguém —', cur('captain'))}${act.map(u => opt(u.id, u.full_name, cur('captain'))).join('')}</select></div>
+    <div class="field"><label>${icon('crown', 13)} Vice-capitão</label><select class="input" id="cVice">${opt('', '— Ninguém —', cur('vice'))}${act.map(u => opt(u.id, u.full_name, cur('vice'))).join('')}</select></div></div>`,
+    foot:`<span class="spacer"></span><button class="btn" data-close>Cancelar</button><button class="btn primary" id="cSave">Salvar</button>`});
+  m.q('#cSave').onclick = async () => {
+    try { await call('users.badge', {captain_id:m.q('#cCap').value || null, vice_id:m.q('#cVice').value || null}); m.close(); toast('Capitania atualizada 🏁', 'ok'); await reload(); }
+    catch (e) { toast(e.message, 'err'); }
+  };
+}
 const assignableRoles = () => State.roles.filter(r => isAdmin() || r.level < State.level);
 registerModule({id:'team', title:'Equipe', icon:'users', section:'Equipe', subtitle:() => `${plural(State.users.filter(u => u.active).length, 'integrante ativo', 'integrantes ativos')}`,
   render(view, actions) {
     if (can('users.manage')) { actions.innerHTML = `<button class="btn primary" id="newUser">${icon('plus')} Novo integrante</button>`; $('#newUser').onclick = () => openUser(null); }
     const tab = State.prefs.teamTab || 'list';
-    view.innerHTML = `<div class="toolbar"><div class="seg" id="teamTabs"><button data-t="list" class="${tab === 'list' ? 'on' : ''}">${icon('list', 16)}Integrantes</button><button data-t="org" class="${tab === 'org' ? 'on' : ''}">${icon('tree', 16)}Organograma</button></div>
+    view.innerHTML = `<div id="captBox"></div><div class="toolbar"><div class="seg" id="teamTabs"><button data-t="list" class="${tab === 'list' ? 'on' : ''}">${icon('list', 16)}Integrantes</button><button data-t="org" class="${tab === 'org' ? 'on' : ''}">${icon('tree', 16)}Organograma</button></div>
       <div class="search">${icon('search', 16)}<input class="input" id="uQ" placeholder="Buscar integrante…"></div>
       <label class="inline-check"><input type="checkbox" id="uInactive"> Mostrar inativos</label></div><div id="teamBody"></div>`;
     $$('#teamTabs button').forEach(b => b.onclick = () => { State.prefs.teamTab = b.dataset.t; savePrefs(); $$('#teamTabs button').forEach(x => x.classList.toggle('on', x === b)); renderTeamBody(); });
@@ -740,8 +1017,9 @@ registerModule({id:'team', title:'Equipe', icon:'users', section:'Equipe', subti
   refresh() { renderTeamBody(); }});
 function renderTeamBody() {
   const el = $('#teamBody'); if (!el) return;
+  const cb = $('#captBox'); if (cb) { cb.innerHTML = captainCard(); if ($('#capBtn')) $('#capBtn').onclick = openCaptain; }
   const q = ($('#uQ').value || '').toLowerCase(), showInactive = $('#uInactive').checked;
-  const openOf = id => State.tasks.filter(t => t.assignee_id === id && t.status !== 'done');
+  const openOf = id => collapseRecur(State.tasks.filter(t => t.assignee_id === id && t.status !== 'done')).list;
   const users = State.users.filter(u => (showInactive || u.active) && (!q || `${u.full_name} ${u.username} ${u.role_name || ''}`.toLowerCase().includes(q)))
     .sort((a, b) => (b.role_level || 0) - (a.role_level || 0) || a.full_name.localeCompare(b.full_name));
   if ((State.prefs.teamTab || 'list') === 'org') {
@@ -749,22 +1027,22 @@ function renderTeamBody() {
     active.forEach(u => { const k = u.manager_id && ids.has(u.manager_id) ? u.manager_id : '__root'; (kids[k] ||= []).push(u); });
     Object.values(kids).forEach(a => a.sort((x, y) => (y.role_level || 0) - (x.role_level || 0) || x.full_name.localeCompare(y.full_name)));
     const seen = new Set();
-    const node = u => { if (seen.has(u.id)) return ''; seen.add(u.id); const it = itemById(u.item_id);
-      return `<li><div class="node" data-uid="${u.id}">${avatar(u, 36)}<div><b>${esc(u.full_name)}</b><div class="row" style="margin-top:3px">${rolePill(u)}${it ? `<span class="item-tag sm" style="--c:${it.color}"><span class="sq"></span>${esc(it.name)}</span>` : ''}</div></div><span class="cnt">${openOf(u.id).length} abertas</span></div>${(kids[u.id] || []).length ? `<ul>${kids[u.id].map(node).join('')}</ul>` : ''}</li>`; };
+    const node = u => { if (seen.has(u.id)) return ''; seen.add(u.id);
+      return `<li><div class="node" data-uid="${u.id}">${avatar(u, 36)}<div><b>${esc(u.full_name)} ${badgeHtml(u, true)}</b><div class="row" style="margin-top:3px">${rolePill(u)}${userItemTags(u, true)}</div></div><span class="cnt">${openOf(u.id).length} abertas</span></div>${(kids[u.id] || []).length ? `<ul>${kids[u.id].map(node).join('')}</ul>` : ''}</li>`; };
     el.innerHTML = `<div class="card" style="padding:20px;overflow:auto"><ul class="tree">${(kids.__root || []).map(node).join('')}</ul></div><div class="foot-note">O organograma é montado pelo campo “Superior direto” de cada integrante.</div>`;
     $$('.node', el).forEach(n => n.onclick = () => { const u = userById(n.dataset.uid); canManageUser(u) ? openUser(u) : gotoTasks({user:u.id}); });
     return;
   }
   if (isMobile()) {
     el.innerHTML = `<div class="mlist">${users.map(u => { const o = openOf(u.id), l = o.filter(isLate).length;
-      return `<div class="mtask" data-uid="${u.id}">${avatar(u, 38)}<div class="mt-main"><div class="t-title">${esc(u.full_name)}${u.active ? '' : ' <span class="muted sm">(inativo)</span>'}</div><div class="mt-meta">${rolePill(u)}<span class="muted sm">${o.length} abertas${l ? ` · <span class="red">${l} atras.</span>` : ''}</span></div></div>${canManageUser(u) ? `<button class="btn ghost icon" data-edit="${u.id}" title="Editar">${icon('edit', 16)}</button>` : ''}</div>`; }).join('')}</div>`;
+      return `<div class="mtask" data-uid="${u.id}">${avatar(u, 38)}<div class="mt-main"><div class="t-title">${esc(u.full_name)} ${badgeHtml(u, true)}${u.active ? '' : ' <span class="muted sm">(inativo)</span>'}</div><div class="mt-meta">${rolePill(u)}${userItemTags(u, true)}<span class="muted sm">${o.length} abertas${l ? ` · <span class="red">${l} atras.</span>` : ''}</span></div></div>${canManageUser(u) ? `<button class="btn ghost icon" data-edit="${u.id}" title="Editar">${icon('edit', 16)}</button>` : ''}</div>`; }).join('')}</div>`;
     $('.mlist', el).onclick = e => { const r = e.target.closest('[data-uid]'); if (!r) return; const u = userById(r.dataset.uid); if (e.target.closest('[data-edit]')) return openUser(u); gotoTasks({user:u.id}); };
     return;
   }
-  el.innerHTML = `<div class="card table-wrap"><table class="tbl"><thead><tr><th class="nosort">Integrante</th><th class="nosort">Cargo</th><th class="nosort">Item principal</th><th class="nosort">Superior</th><th class="nosort">Abertas</th><th class="nosort">Situação</th><th class="nosort"></th></tr></thead><tbody>
-    ${users.map(u => { const it = itemById(u.item_id), mg = userById(u.manager_id), o = openOf(u.id), l = o.filter(isLate).length;
-      return `<tr class="trow" data-uid="${u.id}"><td><div class="user-cell">${avatar(u, 34)}<div><b>${esc(u.full_name)}</b><div class="muted sm">@${esc(u.username)}</div></div></div></td>
-        <td>${rolePill(u)}</td><td>${it ? `<span class="item-tag" style="--c:${it.color}"><span class="sq"></span>${esc(it.name)}</span>` : '<span class="muted">—</span>'}</td>
+  el.innerHTML = `<div class="card table-wrap"><table class="tbl"><thead><tr><th class="nosort">Integrante</th><th class="nosort">Cargo</th><th class="nosort">Itens</th><th class="nosort">Superior</th><th class="nosort">Abertas</th><th class="nosort">Situação</th><th class="nosort"></th></tr></thead><tbody>
+    ${users.map(u => { const mg = userById(u.manager_id), o = openOf(u.id), l = o.filter(isLate).length;
+      return `<tr class="trow" data-uid="${u.id}"><td><div class="user-cell">${avatar(u, 34)}<div><b>${esc(u.full_name)}</b> ${badgeHtml(u)}<div class="muted sm">@${esc(u.username)}</div></div></div></td>
+        <td>${rolePill(u)}</td><td><div class="item-stack">${userItemTags(u) || '<span class="muted">—</span>'}</div></td>
         <td>${mg ? userCell(mg.id) : '<span class="muted">—</span>'}</td><td><b>${o.length}</b>${l ? ` <span class="red sm">· ${l} atras.</span>` : ''}</td>
         <td>${u.active ? pill('Ativo', '#22c55e') : pill('Inativo', '#94a3b8')}</td>
         <td style="text-align:right;white-space:nowrap"><button class="btn ghost icon" data-tasks="${u.id}" title="Ver tarefas">${icon('tasks', 16)}</button>${canManageUser(u) ? `<button class="btn ghost icon" data-edit="${u.id}" title="Editar">${icon('edit', 16)}</button>` : ''}</td></tr>`; }).join('')}
@@ -786,12 +1064,14 @@ function openUser(u) {
       <div class="field"><label>Cargo</label><select class="input" id="uRole">${roleOpts}</select></div>
       <div class="field"><label>Superior direto</label><select class="input" id="uMgr">${opt('', '— Nenhum —', u.manager_id)}${State.users.filter(x => x.active && x.id !== u.id).map(x => opt(x.id, x.full_name, u.manager_id)).join('')}</select></div>
       <div class="field"><label>Item principal</label><select class="input" id="uItem">${opt('', '— Nenhum —', u.item_id)}${State.items.map(i => opt(i.id, i.name, u.item_id)).join('')}</select></div>
+      <div class="field"><label>Item secundário</label><select class="input" id="uItem2">${opt('', '— Nenhum —', u.item2_id)}${State.items.map(i => opt(i.id, i.name, u.item2_id)).join('')}</select></div>
+      <div class="field"><label>Item terciário</label><select class="input" id="uItem3">${opt('', '— Nenhum —', u.item3_id)}${State.items.map(i => opt(i.id, i.name, u.item3_id)).join('')}</select></div>
       <div class="field"><label>${isNew ? 'Senha inicial' : 'Redefinir senha'}</label><input class="input" type="text" id="uPw" placeholder="${isNew ? 'mín. 6 caracteres' : 'deixe vazio para manter'}" spellcheck="false"><div class="hint">O integrante troca a senha no próximo acesso.</div></div>
       ${!isNew ? `<label class="switch span2"><input type="checkbox" id="uActive" ${u.active ? 'checked' : ''}><span class="lbl"><b>Acesso ativo</b><small>Desative quem saiu da equipe (o histórico é mantido).</small></span></label>` : ''}</div>`,
     foot:`<span class="spacer"></span><button class="btn" data-close>Cancelar</button><button class="btn primary" id="uSave">Salvar</button>`});
   m.q('#uSave').onclick = async () => {
     const user = {id:u.id, full_name:m.q('#uName').value, username:m.q('#uUser').value, email:m.q('#uEmail').value, role_id:m.q('#uRole').value,
-      manager_id:m.q('#uMgr').value || null, item_id:m.q('#uItem').value || null, password:m.q('#uPw').value, active:isNew ? true : m.q('#uActive').checked};
+      manager_id:m.q('#uMgr').value || null, item_id:m.q('#uItem').value || null, item2_id:m.q('#uItem2').value || null, item3_id:m.q('#uItem3').value || null, password:m.q('#uPw').value, active:isNew ? true : m.q('#uActive').checked};
     try { await call('users.save', {user}); m.close(); toast(isNew ? 'Integrante cadastrado 🎉' : 'Integrante atualizado', 'ok'); await reload(); } catch (e) { toast(e.message, 'err'); }
   };
 }
@@ -838,7 +1118,7 @@ registerModule({id:'system', title:'Sistema', icon:'db', section:'Administraçã
     view.innerHTML = `<div class="dash">
       <div class="card"><div class="card-h"><h3>${icon('db', 18)} Banco de dados</h3></div><div class="card-b"><dl class="kv">
         <dt>Onde fica</dt><dd>Cloudflare D1 (SQLite na nuvem)</dd>
-        <dt>Registros</dt><dd>${s.counts.tasks} tarefas · ${s.counts.comments} comentários · ${s.counts.users} integrantes · ${s.counts.items} itens</dd>
+        <dt>Registros</dt><dd>${s.counts.tasks} tarefas · ${s.counts.comments} comentários · ${s.counts.users} integrantes · ${s.counts.items} itens · ${s.counts.posts ?? 0} recados · ${s.counts.series ?? 0} repetições</dd>
         <dt>Sessões ativas</dt><dd>${s.counts.sessions}</dd><dt>Alterações</dt><dd>${esc(s.data_version)}</dd><dt>Versão</dt><dd>${esc(s.version)}</dd></dl></div></div>
       <div class="card"><div class="card-h"><h3>${icon('history', 18)} Backups</h3></div><div class="card-b">
         <p class="muted" style="margin-top:0;line-height:1.55">A Cloudflare guarda sozinha o histórico dos <b>últimos 7 dias</b> (dá para voltar o banco a qualquer minuto desse período). Para guardar por mais tempo, baixe um backup completo de vez em quando — sugestão: toda semana, numa pasta do Drive.</p>
@@ -852,7 +1132,7 @@ registerModule({id:'system', title:'Sistema', icon:'db', section:'Administraçã
 // ───────── perfil ─────────
 function openProfile() {
   const me = State.me, t = State.prefs.theme || 'system';
-  const m = openModal({title:'Meu perfil', size:'mid', body:`<div class="row" style="gap:14px;margin-bottom:18px">${avatar(me, 56)}<div><b style="font-size:17px">${esc(me.full_name)}</b><div class="muted">@${esc(me.username)} · ${rolePill(me)}</div></div></div>
+  const m = openModal({title:'Meu perfil', size:'mid', body:`<div class="row" style="gap:14px;margin-bottom:18px">${avatar(me, 56)}<div><b style="font-size:17px">${esc(me.full_name)}</b><div class="muted row" style="flex-wrap:wrap">@${esc(me.username)} · ${rolePill(me)}${badgeHtml(me)}</div></div></div>
     <div class="grid2"><div class="field"><label>Nome completo</label><input class="input" id="pName" value="${esc(me.full_name)}"></div>
     <div class="field"><label>E-mail</label><input class="input" id="pEmail" value="${esc(me.email || '')}"></div>
     <div class="field span2"><label>Tema</label><div class="seg" id="pTheme">${[['system','monitor','Automático'],['light','sun','Claro'],['dark','moon','Escuro']].map(([v, ic, l]) => `<button data-v="${v}" class="${t === v ? 'on' : ''}">${icon(ic, 15)}${l}</button>`).join('')}</div></div>

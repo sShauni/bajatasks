@@ -1,6 +1,6 @@
 {
   "name": "bajadegalpao-tasks",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "description": "Gerenciador de tarefas da equipe Baja de Galpão (Cloudflare Workers + D1)",
   "scripts": {

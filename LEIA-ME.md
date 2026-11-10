@@ -13,6 +13,15 @@ Funciona no navegador do PC e do celular, e pode ser instalado como app.
 - A tela se atualiza sozinha a cada ~15 segundos (e na hora em que você volta para o app).
 - Atalhos no PC: `N` cria tarefa, `/` vai para a busca, `Ctrl+Enter` salva.
 
+## Recursos (v2.1)
+- **Etapas:** dentro de cada tarefa, uma lista de etapas (cada uma pode ter um responsável). Cada etapa concluída soma no progresso automaticamente (3 de 4 = 75%). Quem é responsável só por uma etapa pode marcá-la, mesmo sem poder editar a tarefa.
+- **Apoio:** além do responsável principal, a tarefa pode ter integrantes de apoio. Eles também editam a tarefa e a veem no filtro **☆ Em que eu ajudo**. Os contadores e a carga da equipe contam só o responsável principal.
+- **Horário:** o prazo pode ter hora (ex.: reunião às 19:00).
+- **Repetições:** ao criar uma tarefa, escolha **Repetir** (diária, semanal em certos dias, mensal). As próximas 8 semanas aparecem no calendário; um gatilho diário da Cloudflare cria as seguintes. Lista e quadro mostram só a próxima ocorrência de cada repetição. Gerencie em **Tarefas → Repetições**.
+- **Mural:** recados para toda a equipe. Qualquer integrante publica; quem tem a permissão “Moderar o mural” fixa no topo e apaga recados de outros.
+- **Itens secundário e terciário** no cadastro do integrante.
+- **Capitão e vice-capitão:** título de destaque (não muda permissões). Quem tem “Nomear capitão e vice-capitão” define em **Equipe → Nomear**.
+
 ## Cargos e hierarquia
 Iguais aos da versão anterior: Administrador (100), Gerente (80), Líder de subsistema (50), Integrante (20) e Trainee (10).
 Quem gerencia só mexe em quem está **abaixo** do próprio nível e não pode dar permissões que não tem.
@@ -41,6 +50,7 @@ O líder de um item edita todas as tarefas daquele item. Tudo é editável em **
 |---|---|
 | 100 mil requisições/dia | ~20 pessoas com o app aberto o dia todo usam ~40 mil (checagem a cada 15 s, só com o app visível) |
 | 10 ms de CPU por requisição | O cálculo da senha foi ajustado para caber; o resto do app usa bem menos |
+| 50 consultas ao banco por requisição | Gravações em lote usam uma instrução só (listas vão como JSON) |
 | 5 milhões de linhas lidas e 100 mil gravadas por dia | Uso típico: dezenas de milhares lidas, centenas gravadas |
 | 5 GB de banco | Alguns MB por ano de uso |
 
@@ -64,11 +74,14 @@ npm run dev
 ```
 Abra `http://127.0.0.1:8787`.
 
-Publicar uma nova versão:
+Publicar uma nova versão (sempre nesta ordem: banco primeiro, depois o código):
 ```bash
 npm run db:remote
 npm run deploy
 ```
+Migrações devem só **acrescentar** (tabelas/colunas novas), para a versão anterior continuar funcionando durante a troca.
+
+Testar o gatilho diário das repetições no PC: rode `npx -y wrangler@4.153.0 dev --test-scheduled` e abra `http://127.0.0.1:8787/__scheduled?cron=0+9+*+*+*`.
 
 Primeira publicação (já feita uma vez; fica aqui de referência):
 1. `npm run login` — autoriza o wrangler na conta da Cloudflare.

@@ -18,5 +18,7 @@
       "migrations_dir": "migrations"
     }
   ],
+  // Uma vez por dia (09:00 UTC = 06:00 em Brasília) completa as ocorrências das tarefas recorrentes.
+  "triggers": { "crons": ["0 9 * * *"] },
   "observability": { "enabled": true }
 }

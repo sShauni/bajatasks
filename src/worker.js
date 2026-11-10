@@ -14,10 +14,17 @@
 //     Se gravar algo, inclua bump(env) para os outros aparelhos atualizarem.
 //  3. Permissão nova? Adicione em PERMISSIONS (o admin liga nos cargos).
 //  4. Interface (public/app.js): registerModule({ id, title, icon, section, visible, render, refresh }).
+//
+//  Tarefas recorrentes: uma série (tabela recurrences) gera tarefas normais até RECUR_HORIZON_DAYS
+//  à frente. A geração roda ao salvar a série e uma vez por dia (gatilho "crons" no wrangler.jsonc).
 // ════════════════════════════════════════════════════════════════════════════
 
 const APP_NAME = 'Baja de Galpão Tasks';
-const APP_VERSION = '2.0.0';
+const APP_VERSION = '2.1.0';
+const RECUR_HORIZON_DAYS = 56;   // ocorrências futuras visíveis (8 semanas)
+const RECUR_MAX_PER_RUN = 60;    // teto de ocorrências criadas por série em cada geração
+const MAX_MEMBERS = 15;          // integrantes de apoio por tarefa
+const MAX_SUBTASKS = 50;         // etapas por tarefa
 // Iterações do PBKDF2. O plano grátis limita a CPU por requisição (10 ms), então o valor é
 // menor que o ideal; o limite de tentativas de login compensa. O número fica gravado em cada
 // hash, então dá para aumentar no futuro sem quebrar as senhas existentes.
@@ -49,8 +56,11 @@ const PERMISSIONS = [
   { id: 'items.manage', label: 'Gerenciar itens / subsistemas' },
   { id: 'users.manage', label: 'Gerenciar integrantes (abaixo do seu nível)' },
   { id: 'roles.manage', label: 'Gerenciar cargos e hierarquia' },
+  { id: 'mural.manage', label: 'Moderar o mural (fixar e apagar recados de outros)' },
+  { id: 'team.captain', label: 'Nomear capitão e vice-capitão' },
   { id: 'system.admin', label: 'Administração do sistema (backups)' },
 ];
+const FREQS = { daily: 'dia', weekly: 'semana', monthly: 'mês' };
 const STATUS_LABEL = Object.fromEntries(STATUSES.map(x => [x.id, x.label]));
 const PRIO_LABEL = Object.fromEntries(PRIORITIES.map(x => [x.id, x.label]));
 const PERM_IDS = PERMISSIONS.map(x => x.id);
@@ -96,7 +106,17 @@ function optDate(v) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(d) || isNaN(Date.parse(d + 'T00:00:00Z'))) throw new ApiError('Data inválida.');
   return d;
 }
+function optTime(v) {
+  if (!v) return null;
+  const t = String(v).slice(0, 5);
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(t)) throw new ApiError('Horário inválido (use HH:MM).');
+  return t;
+}
 const brDate = iso => { const [y, m, d] = iso.split('-'); return `${d}/${m}/${y}`; };
+// "Hoje" no horário de Brasília (UTC-3, sem horário de verão desde 2019).
+const todayBR = () => new Date(Date.now() - 3 * 3600e3).toISOString().slice(0, 10);
+const addDays = (iso, n) => new Date(Date.parse(iso + 'T00:00:00Z') + n * 864e5).toISOString().slice(0, 10);
+const csv = v => (v ? String(v).split(',').filter(Boolean) : []);
 
 // ── banco ───────────────────────────────────────────────────────────────────
 const q = (env, sql, ...args) => env.DB.prepare(sql).bind(...args);
@@ -108,6 +128,32 @@ async function optRef(env, table, v) {
   if (!(await first(env, `SELECT 1 AS x FROM ${table} WHERE id = ? AND deleted = 0`, v)))
     throw new ApiError('Referência inválida (registro não encontrado ou excluído).');
   return v;
+}
+// Confere uma lista de integrantes de uma vez só (uma consulta).
+// Listas vão como um único parâmetro JSON (json_each): cada gravação em lote vira uma instrução só,
+// longe do limite de consultas por requisição do plano grátis.
+const J = v => JSON.stringify(v);
+async function validUserIds(env, ids) {
+  const list = [...new Set(ids.filter(x => typeof x === 'string' && x))];
+  if (!list.length) return [];
+  const rows = await all(env, 'SELECT id FROM users WHERE deleted = 0 AND id IN (SELECT value FROM json_each(?))', J(list));
+  if (rows.length !== list.length) throw new ApiError('Referência inválida (integrante não encontrado ou excluído).');
+  return list;
+}
+// Integrantes de apoio: sem repetição, sem o responsável principal, em ordem estável.
+async function cleanMembers(env, v, assigneeId) {
+  if (!Array.isArray(v)) return [];
+  const list = (await validUserIds(env, v)).filter(x => x !== assigneeId).sort();
+  if (list.length > MAX_MEMBERS) throw new ApiError(`No máximo ${MAX_MEMBERS} integrantes de apoio por tarefa.`);
+  return list;
+}
+// Etapas enviadas junto com uma tarefa nova ou com o modelo de uma série.
+async function cleanSubtaskList(env, v) {
+  if (!Array.isArray(v)) return [];
+  const list = v.map(x => ({ title: s(x && x.title, 200), assignee_id: (x && x.assignee_id) || null })).filter(x => x.title);
+  if (list.length > MAX_SUBTASKS) throw new ApiError(`No máximo ${MAX_SUBTASKS} etapas por tarefa.`);
+  await validUserIds(env, list.map(x => x.assignee_id).filter(Boolean));
+  return list;
 }
 
 // ── sessão e permissões ─────────────────────────────────────────────────────
@@ -150,8 +196,10 @@ async function createSession(env, res, userId) {
   res.headers.append('Set-Cookie', cookie(token, SESSION_DAYS * 86400));
 }
 const canManageLevel = (ctx, level) => ctx.admin || (level || 0) < ctx.level;
-const canViewTask = (ctx, t) => ctx.can('tasks.view_all') || [t.assignee_id, t.created_by, t.item_leader].includes(ctx.id);
-const canEditTask = (ctx, t) => ctx.can('tasks.edit_all') || [t.assignee_id, t.created_by, t.item_leader].includes(ctx.id);
+// Quem participa: responsável, criador, líder do item e integrantes de apoio.
+const isInvolved = (ctx, t) => [t.assignee_id, t.created_by, t.item_leader].includes(ctx.id) || csv(t.member_ids).includes(ctx.id);
+const canViewTask = (ctx, t) => ctx.can('tasks.view_all') || isInvolved(ctx, t) || csv(t.sub_users).includes(ctx.id);
+const canEditTask = (ctx, t) => ctx.can('tasks.edit_all') || isInvolved(ctx, t);
 const canDeleteTask = (ctx, t) => ctx.can('tasks.delete') || t.created_by === ctx.id;
 
 // Quantos administradores ativos sobram, ignorando um usuário e/ou um cargo.
@@ -204,6 +252,10 @@ export default {
     const url = new URL(req.url);
     if (url.pathname.startsWith('/api/')) return handleApi(req, env, url.pathname.slice(5));
     return env.ASSETS.fetch(req);
+  },
+  // Gatilho diário (wrangler.jsonc → triggers.crons): completa as ocorrências das séries recorrentes.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(generateAllSeries(env));
   },
 };
 
@@ -304,43 +356,82 @@ api('auth.update_profile', {}, async ({ env, ctx, p }) => {
 // ════════════════════════════════════════════════════════════════════════════
 const TASK_SELECT = `
 SELECT t.*, i.name AS item_name, i.color AS item_color, i.leader_id AS item_leader,
-       a.full_name AS assignee_name, c.full_name AS creator_name, ub.full_name AS updater_name
+       a.full_name AS assignee_name, c.full_name AS creator_name, ub.full_name AS updater_name,
+       (SELECT group_concat(m.user_id) FROM task_members m WHERE m.task_id = t.id) AS member_ids,
+       (SELECT COUNT(*) FROM subtasks st WHERE st.task_id = t.id AND st.deleted = 0) AS sub_total,
+       (SELECT COUNT(*) FROM subtasks st WHERE st.task_id = t.id AND st.deleted = 0 AND st.done = 1) AS sub_done,
+       (SELECT group_concat(DISTINCT st.assignee_id) FROM subtasks st WHERE st.task_id = t.id AND st.deleted = 0) AS sub_users
 FROM tasks t
 LEFT JOIN items i ON i.id = t.item_id
 LEFT JOIN users a ON a.id = t.assignee_id
 LEFT JOIN users c ON c.id = t.created_by
 LEFT JOIN users ub ON ub.id = t.updated_by`;
-const USER_SELECT = `SELECT u.id, u.username, u.full_name, u.email, u.role_id, u.manager_id, u.item_id, u.active, u.must_change_pw,
-       u.created_at, u.updated_at, r.name AS role_name, r.level AS role_level, r.color AS role_color
+const USER_SELECT = `SELECT u.id, u.username, u.full_name, u.email, u.role_id, u.manager_id, u.item_id, u.item2_id, u.item3_id, u.badge,
+       u.active, u.must_change_pw, u.created_at, u.updated_at, r.name AS role_name, r.level AS role_level, r.color AS role_color
 FROM users u LEFT JOIN roles r ON r.id = u.role_id`;
-const taskOut = (ctx, t) => ({ ...t, can_edit: canEditTask(ctx, t), can_delete: canDeleteTask(ctx, t) });
+const taskOut = (ctx, t) => {
+  const { member_ids, sub_users, ...rest } = t;
+  return { ...rest, members: csv(member_ids), sub_users: csv(sub_users), can_edit: canEditTask(ctx, t), can_delete: canDeleteTask(ctx, t) };
+};
 const getTaskRow = (env, id) => first(env, TASK_SELECT + ' WHERE t.id = ? AND t.deleted = 0', id || '');
+const POST_SELECT = `SELECT p.*, u.full_name AS user_name FROM posts p LEFT JOIN users u ON u.id = p.user_id WHERE p.deleted = 0`;
+const seriesOut = r => ({ ...r, members: JSON.parse(r.members || '[]'), subtasks: JSON.parse(r.subtasks || '[]'), weekdays: JSON.parse(r.weekdays || '[]') });
 
 api('app.data', {}, async ({ env, ctx }) => {
-  const taskStmt = ctx.can('tasks.view_all')
+  const viewAll = ctx.can('tasks.view_all');
+  const taskStmt = viewAll
     ? q(env, TASK_SELECT + ' WHERE t.deleted = 0')
-    : q(env, TASK_SELECT + ' WHERE t.deleted = 0 AND (t.assignee_id = ? OR t.created_by = ? OR i.leader_id = ?)', ctx.id, ctx.id, ctx.id);
-  const [roles, users, items, tasks, ver] = (await env.DB.batch([
+    : q(env, TASK_SELECT + ` WHERE t.deleted = 0 AND (t.assignee_id = ? OR t.created_by = ? OR i.leader_id = ?
+          OR EXISTS (SELECT 1 FROM task_members m WHERE m.task_id = t.id AND m.user_id = ?)
+          OR EXISTS (SELECT 1 FROM subtasks st WHERE st.task_id = t.id AND st.deleted = 0 AND st.assignee_id = ?))`,
+      ctx.id, ctx.id, ctx.id, ctx.id, ctx.id);
+  const [roles, users, items, tasks, ver, posts, series] = (await env.DB.batch([
     q(env, `SELECT r.*, (SELECT COUNT(*) FROM users u WHERE u.role_id = r.id AND u.deleted = 0 AND u.active = 1) AS user_count
             FROM roles r WHERE r.deleted = 0 ORDER BY r.level DESC, r.name`),
     q(env, USER_SELECT + ' WHERE u.deleted = 0 ORDER BY u.full_name COLLATE NOCASE'),
     q(env, 'SELECT * FROM items WHERE deleted = 0 ORDER BY sort, name COLLATE NOCASE'),
     taskStmt,
     q(env, "SELECT value FROM meta WHERE key = 'data_version'"),
+    q(env, POST_SELECT + ' ORDER BY p.pinned DESC, p.created_at DESC LIMIT 100'),
+    q(env, 'SELECT * FROM recurrences WHERE deleted = 0 ORDER BY title COLLATE NOCASE'),
   ])).map(r => r.results);
   for (const r of roles) r.permissions = JSON.parse(r.permissions);
+  const recurrences = series.map(seriesOut)
+    .filter(r => viewAll || [r.assignee_id, r.created_by].includes(ctx.id) || r.members.includes(ctx.id))
+    .map(r => ({ ...r, can_edit: canEditSeries(ctx, r) }));
   return {
     me: users.find(u => u.id === ctx.id), perms: [...ctx.perms].sort(), level: ctx.level,
     users, items, roles, tasks: tasks.map(t => taskOut(ctx, t)), v: ver[0] ? ver[0].value : '0',
+    posts: posts.map(p => ({ ...p, can_edit: p.user_id === ctx.id, can_delete: p.user_id === ctx.id || ctx.can('mural.manage') })),
+    recurrences,
   };
 });
 
 // ════════════════════════════════════════════════════════════════════════════
 //  TAREFAS
 // ════════════════════════════════════════════════════════════════════════════
-const TASK_FIELDS = ['title', 'description', 'item_id', 'assignee_id', 'priority', 'status', 'start_date', 'due_date', 'progress'];
+const TASK_FIELDS = ['title', 'description', 'item_id', 'assignee_id', 'priority', 'status', 'start_date', 'due_date', 'due_time', 'progress'];
 const FIELD_LABELS = { title: 'Título', description: 'Descrição', item_id: 'Item', assignee_id: 'Responsável', priority: 'Prioridade',
-  status: 'Status', start_date: 'Início', due_date: 'Prazo', progress: 'Progresso' };
+  status: 'Status', start_date: 'Início', due_date: 'Prazo', due_time: 'Horário', progress: 'Progresso' };
+// Progresso automático: com etapas, vira a % de etapas concluídas (100 se a tarefa estiver concluída).
+const autoProgress = (status, total, done, manual) => status === 'done' ? 100 : total ? Math.round(done / total * 100) : manual;
+const userNames = async (env, ids) => {
+  if (!ids.length) return '—';
+  const rows = await all(env, 'SELECT full_name FROM users WHERE id IN (SELECT value FROM json_each(?)) ORDER BY full_name', J(ids));
+  return rows.map(r => r.full_name).join(', ');
+};
+// pares = [{task_id, user_id}, …]
+const membersInsert = (env, pairs) => q(env, `INSERT INTO task_members (task_id, user_id)
+    SELECT json_extract(value, '$.task_id'), json_extract(value, '$.user_id') FROM json_each(?)`, J(pairs));
+const memberStmts = (env, taskId, members) => [
+  q(env, 'DELETE FROM task_members WHERE task_id = ?', taskId),
+  membersInsert(env, members.map(u => ({ task_id: taskId, user_id: u }))),
+];
+// linhas = [{task_id, title, assignee_id, sort}, …]
+const subtasksInsert = (env, rows, now) => q(env, `INSERT INTO subtasks (id, task_id, title, assignee_id, sort, created_at, updated_at)
+    SELECT json_extract(value, '$.id'), json_extract(value, '$.task_id'), json_extract(value, '$.title'),
+           json_extract(value, '$.assignee_id'), json_extract(value, '$.sort'), ?, ? FROM json_each(?)`,
+  now, now, J(rows.map(r => ({ id: newId(), ...r }))));
 
 async function cleanTask(env, t) {
   const title = s(t.title, 200);
@@ -351,9 +442,10 @@ async function cleanTask(env, t) {
   const d = {
     title, description: s(t.description, 20000),
     item_id: await optRef(env, 'items', t.item_id), assignee_id: await optRef(env, 'users', t.assignee_id),
-    priority: pr, status: st, start_date: optDate(t.start_date), due_date: optDate(t.due_date),
+    priority: pr, status: st, start_date: optDate(t.start_date), due_date: optDate(t.due_date), due_time: optTime(t.due_time),
     progress: Math.min(100, Math.max(0, parseInt(t.progress, 10) || 0)),
   };
+  if (!d.due_date) d.due_time = null;
   if (d.start_date && d.due_date && d.start_date > d.due_date) throw new ApiError('A data de início não pode ser depois do prazo.');
   if (st === 'done') d.progress = 100;
   return d;
@@ -381,6 +473,7 @@ const activityStmt = (env, taskId, userId, action, detail, now) =>
 async function saveTask(env, ctx, t, expected = null, force = false) {
   const d = await cleanTask(env, t);
   const now = nowIso();
+  const assignOthers = msg => { if (!ctx.can('tasks.assign')) throw forbidden(msg); };
   let tid = t.id;
   if (tid) {
     const old = await getTaskRow(env, tid);
@@ -388,10 +481,16 @@ async function saveTask(env, ctx, t, expected = null, force = false) {
     if (!canEditTask(ctx, old)) throw forbidden('Você não pode editar esta tarefa.');
     if (expected && expected !== old.updated_at && !force)
       throw new ApiError(`${old.updater_name || 'Outra pessoa'} alterou esta tarefa enquanto você editava.`, 'conflict');
-    if (d.assignee_id !== old.assignee_id && d.assignee_id && d.assignee_id !== ctx.id && !ctx.can('tasks.assign'))
-      throw forbidden('Você não tem permissão para atribuir tarefas a outros integrantes.');
+    if (d.assignee_id !== old.assignee_id && d.assignee_id && d.assignee_id !== ctx.id)
+      assignOthers('Você não tem permissão para atribuir tarefas a outros integrantes.');
+    // Apoio: se não veio na requisição (ex.: mudança rápida de status), mantém o que já existe.
+    const oldMembers = csv(old.member_ids).sort();
+    const members = Array.isArray(t.members) ? await cleanMembers(env, t.members, d.assignee_id) : oldMembers.filter(x => x !== d.assignee_id);
+    if (members.some(u => !oldMembers.includes(u) && u !== ctx.id)) assignOthers('Você não tem permissão para colocar outros integrantes no apoio.');
+    const membersChanged = members.join() !== oldMembers.join();
+    d.progress = autoProgress(d.status, old.sub_total, old.sub_done, d.progress);
     const changes = TASK_FIELDS.filter(f => norm(d[f]) !== norm(old[f]));
-    if (!changes.length) return taskOut(ctx, old);
+    if (!changes.length && !membersChanged) return taskOut(ctx, old);
     let completed = old.completed_at;
     if (d.status === 'done' && old.status !== 'done') completed = now;
     else if (d.status !== 'done') completed = null;
@@ -401,16 +500,26 @@ async function saveTask(env, ctx, t, expected = null, force = false) {
     if (!r.meta.changes) throw new ApiError('Esta tarefa acabou de ser alterada por outra pessoa. Abra de novo e tente outra vez.', 'conflict');
     const stmts = [];
     for (const f of changes) stmts.push(activityStmt(env, tid, ctx.id, 'update', await describeChange(env, f, old[f], d[f]), now));
+    if (membersChanged) {
+      stmts.push(...memberStmts(env, tid, members));
+      stmts.push(activityStmt(env, tid, ctx.id, 'update', `Apoio: ${await userNames(env, oldMembers)} → ${await userNames(env, members)}`, now));
+    }
     stmts.push(bump(env));
     await env.DB.batch(stmts);
   } else {
     ctx.require('tasks.create');
-    if (d.assignee_id && d.assignee_id !== ctx.id && !ctx.can('tasks.assign')) throw forbidden('Você só pode criar tarefas para você mesmo.');
+    if (d.assignee_id && d.assignee_id !== ctx.id) assignOthers('Você só pode criar tarefas para você mesmo.');
+    const members = await cleanMembers(env, t.members, d.assignee_id);
+    if (members.some(u => u !== ctx.id)) assignOthers('Você não tem permissão para colocar outros integrantes no apoio.');
+    const subs = await cleanSubtaskList(env, t.subtasks);
+    d.progress = autoProgress(d.status, subs.length, 0, d.progress);
     tid = newId();
     const cols = [...TASK_FIELDS, 'id', 'created_by', 'completed_at', 'created_at', 'updated_at', 'updated_by'];
     const vals = [...TASK_FIELDS.map(f => d[f]), tid, ctx.id, d.status === 'done' ? now : null, now, now, ctx.id];
     await env.DB.batch([
       q(env, `INSERT INTO tasks (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`, ...vals),
+      membersInsert(env, members.map(u => ({ task_id: tid, user_id: u }))),
+      subtasksInsert(env, subs.map((st, i) => ({ task_id: tid, title: st.title, assignee_id: st.assignee_id, sort: i })), now),
       activityStmt(env, tid, ctx.id, 'create', 'Tarefa criada', now),
       bump(env),
     ]);
@@ -422,13 +531,14 @@ api('tasks.get', {}, async ({ env, ctx, p }) => {
   const t = await getTaskRow(env, p.id);
   if (!t) throw new ApiError('Esta tarefa não existe mais.', 'notfound');
   if (!canViewTask(ctx, t)) throw forbidden('Você não tem acesso a esta tarefa.');
-  const [comments, activity] = (await env.DB.batch([
+  const [comments, activity, subtasks] = (await env.DB.batch([
     q(env, `SELECT c.*, u.full_name AS user_name FROM comments c LEFT JOIN users u ON u.id = c.user_id
             WHERE c.task_id = ? AND c.deleted = 0 ORDER BY c.created_at`, t.id),
     q(env, `SELECT a.*, u.full_name AS user_name FROM activity a LEFT JOIN users u ON u.id = a.user_id
             WHERE a.task_id = ? AND a.deleted = 0 ORDER BY a.created_at DESC LIMIT 100`, t.id),
+    q(env, 'SELECT * FROM subtasks WHERE task_id = ? AND deleted = 0 ORDER BY sort, created_at', t.id),
   ])).map(r => r.results);
-  return { task: taskOut(ctx, t), comments, activity };
+  return { task: taskOut(ctx, t), comments, activity, subtasks };
 });
 
 api('tasks.save', {}, ({ env, ctx, p }) => saveTask(env, ctx, p.task || {}, p.expected_updated_at, !!p.force));
@@ -465,6 +575,267 @@ api('comments.add', {}, async ({ env, ctx, p }) => {
   await q(env, 'INSERT INTO comments (id, task_id, user_id, body, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
     id, t.id, ctx.id, body, now, now).run();
   return { id, task_id: t.id, user_id: ctx.id, user_name: ctx.user.full_name, body, created_at: now };
+});
+
+// ── etapas (checklist) ──────────────────────────────────────────────────────
+// Toda mudança recalcula o progresso da tarefa e devolve a tarefa atualizada
+// (o app usa o novo updated_at para não acusar conflito consigo mesmo).
+const recalcStmt = (env, taskId, userId, now) => q(env, `UPDATE tasks SET
+    progress = CASE WHEN status = 'done' THEN 100
+      WHEN (SELECT COUNT(*) FROM subtasks WHERE task_id = ? AND deleted = 0) = 0 THEN progress
+      ELSE CAST(ROUND(100.0 * (SELECT COUNT(*) FROM subtasks WHERE task_id = ? AND deleted = 0 AND done = 1)
+                / (SELECT COUNT(*) FROM subtasks WHERE task_id = ? AND deleted = 0)) AS INTEGER) END,
+    updated_at = ?, updated_by = ? WHERE id = ?`, taskId, taskId, taskId, now, userId, taskId);
+async function subtaskResult(env, ctx, taskId) {
+  const [t, subs] = await Promise.all([getTaskRow(env, taskId),
+    all(env, 'SELECT * FROM subtasks WHERE task_id = ? AND deleted = 0 ORDER BY sort, created_at', taskId)]);
+  return { task: taskOut(ctx, t), subtasks: subs };
+}
+async function loadSubtask(env, id) {
+  const st = await first(env, 'SELECT * FROM subtasks WHERE id = ? AND deleted = 0', id || '');
+  if (!st) throw new ApiError('Esta etapa não existe mais.', 'notfound');
+  const t = await getTaskRow(env, st.task_id);
+  if (!t) throw new ApiError('Esta tarefa não existe mais.', 'notfound');
+  return { st, t };
+}
+
+api('subtasks.add', {}, async ({ env, ctx, p }) => {
+  const t = await getTaskRow(env, p.task_id);
+  if (!t) throw new ApiError('Esta tarefa não existe mais.', 'notfound');
+  if (!canEditTask(ctx, t)) throw forbidden('Você não pode editar esta tarefa.');
+  const title = s(p.title, 200);
+  if (!title) throw new ApiError('Escreva o nome da etapa.');
+  if (t.sub_total >= MAX_SUBTASKS) throw new ApiError(`No máximo ${MAX_SUBTASKS} etapas por tarefa.`);
+  const assignee = await optRef(env, 'users', p.assignee_id);
+  if (assignee && assignee !== ctx.id && !ctx.can('tasks.assign')) throw forbidden('Você não tem permissão para atribuir etapas a outros integrantes.');
+  const mx = await first(env, 'SELECT COALESCE(MAX(sort), -1) AS m FROM subtasks WHERE task_id = ?', t.id);
+  const now = nowIso();
+  await env.DB.batch([
+    subtasksInsert(env, [{ task_id: t.id, title, assignee_id: assignee, sort: mx.m + 1 }], now),
+    recalcStmt(env, t.id, ctx.id, now),
+    activityStmt(env, t.id, ctx.id, 'update', `Etapa adicionada: ${title}`, now),
+    bump(env),
+  ]);
+  return subtaskResult(env, ctx, t.id);
+});
+
+api('subtasks.update', {}, async ({ env, ctx, p }) => {
+  const { st, t } = await loadSubtask(env, p.id);
+  const ch = p.changes || {};
+  const onlyToggle = Object.keys(ch).every(k => k === 'done');
+  // Quem é responsável pela etapa pode marcá-la, mesmo sem poder editar a tarefa.
+  if (!canEditTask(ctx, t) && !(onlyToggle && st.assignee_id === ctx.id)) throw forbidden('Você não pode alterar esta etapa.');
+  const title = 'title' in ch ? s(ch.title, 200) : st.title;
+  if (!title) throw new ApiError('Escreva o nome da etapa.');
+  let assignee = st.assignee_id;
+  if ('assignee_id' in ch) {
+    assignee = await optRef(env, 'users', ch.assignee_id);
+    if (assignee && assignee !== st.assignee_id && assignee !== ctx.id && !ctx.can('tasks.assign'))
+      throw forbidden('Você não tem permissão para atribuir etapas a outros integrantes.');
+  }
+  const done = 'done' in ch ? (ch.done ? 1 : 0) : st.done;
+  const now = nowIso();
+  const stmts = [
+    q(env, 'UPDATE subtasks SET title = ?, assignee_id = ?, done = ?, done_at = ?, done_by = ?, updated_at = ? WHERE id = ?',
+      title, assignee, done, done ? (st.done ? st.done_at : now) : null, done ? (st.done ? st.done_by : ctx.id) : null, now, st.id),
+    recalcStmt(env, t.id, ctx.id, now), bump(env),
+  ];
+  if (done !== st.done) stmts.push(activityStmt(env, t.id, ctx.id, 'update', `${done ? 'Etapa concluída' : 'Etapa reaberta'}: ${title}`, now));
+  await env.DB.batch(stmts);
+  return subtaskResult(env, ctx, t.id);
+});
+
+api('subtasks.delete', {}, async ({ env, ctx, p }) => {
+  const { st, t } = await loadSubtask(env, p.id);
+  if (!canEditTask(ctx, t)) throw forbidden('Você não pode alterar esta tarefa.');
+  const now = nowIso();
+  await env.DB.batch([
+    q(env, 'UPDATE subtasks SET deleted = 1, updated_at = ? WHERE id = ?', now, st.id),
+    recalcStmt(env, t.id, ctx.id, now),
+    activityStmt(env, t.id, ctx.id, 'update', `Etapa removida: ${st.title}`, now),
+    bump(env),
+  ]);
+  return subtaskResult(env, ctx, t.id);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+//  TAREFAS RECORRENTES (séries)
+// ════════════════════════════════════════════════════════════════════════════
+const canEditSeries = (ctx, r) => ctx.can('tasks.edit_all') || r.created_by === ctx.id || r.assignee_id === ctx.id;
+
+// Datas da série entre "from" e "to" (inclusive), no formato AAAA-MM-DD.
+function seriesDates(r, from, to) {
+  const out = [], D = iso => Date.parse(iso + 'T00:00:00Z'), day = 864e5;
+  const start = D(r.start_date), lo = Math.max(D(from), start);
+  const hi = Math.min(D(to), r.end_date ? D(r.end_date) : Infinity);
+  const every = Math.max(1, r.every | 0);
+  if (lo > hi) return out;
+  if (r.freq === 'daily') {
+    for (let d = start + Math.ceil((lo - start) / day / every) * every * day; d <= hi; d += every * day) out.push(d);
+  } else if (r.freq === 'weekly') {
+    const wd = r.weekdays.length ? r.weekdays : [new Date(start).getUTCDay()];
+    const week0 = start - new Date(start).getUTCDay() * day;
+    for (let d = lo; d <= hi; d += day) {
+      const dt = new Date(d);
+      const weeks = Math.round((d - dt.getUTCDay() * day - week0) / (7 * day));
+      if (weeks % every === 0 && wd.includes(dt.getUTCDay())) out.push(d);
+    }
+  } else {
+    const s0 = new Date(start), dom = s0.getUTCDate();
+    for (let k = 0; ; k += every) {
+      const y = s0.getUTCFullYear(), m = s0.getUTCMonth() + k;
+      const dim = new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
+      const d = Date.UTC(y, m, Math.min(dom, dim));
+      if (d > hi) break;
+      if (d >= lo) out.push(d);
+    }
+  }
+  return out.map(d => new Date(d).toISOString().slice(0, 10));
+}
+
+// Cria as ocorrências que faltam (de hoje até o horizonte). Ocorrências já criadas,
+// inclusive as excluídas à mão (ex.: reunião cancelada), não são recriadas.
+async function generateSeries(env, r, have = null) {
+  const today = todayBR();
+  const dates = seriesDates(r, today, addDays(today, RECUR_HORIZON_DAYS));
+  if (!dates.length) return 0;
+  have = have || new Set((await all(env, 'SELECT due_date FROM tasks WHERE recur_id = ? AND due_date >= ?', r.id, today)).map(x => x.due_date));
+  const todo = dates.filter(d => !have.has(d)).slice(0, RECUR_MAX_PER_RUN);
+  if (!todo.length) return 0;
+  const now = nowIso();
+  const occ = todo.map(date => ({ id: newId(), date }));
+  // Quatro instruções no total, não importa quantas ocorrências.
+  await env.DB.batch([
+    q(env, `INSERT INTO tasks (id, title, description, item_id, assignee_id, created_by, priority, status, start_date, due_date, due_time,
+        progress, recur_id, created_at, updated_at, updated_by)
+      SELECT json_extract(value, '$.id'), ?, ?, ?, ?, ?, ?, 'todo', json_extract(value, '$.date'), json_extract(value, '$.date'), ?, 0, ?, ?, ?, ?
+      FROM json_each(?)`,
+      r.title, r.description, r.item_id, r.assignee_id, r.created_by, r.priority, r.due_time, r.id, now, now, r.created_by, J(occ)),
+    membersInsert(env, occ.flatMap(o => r.members.map(u => ({ task_id: o.id, user_id: u })))),
+    subtasksInsert(env, occ.flatMap(o => r.subtasks.map((st, i) => ({ task_id: o.id, title: st.title, assignee_id: st.assignee_id, sort: i }))), now),
+    q(env, `INSERT INTO activity (id, task_id, user_id, action, detail, created_at, updated_at)
+      SELECT lower(hex(randomblob(16))), json_extract(value, '$.id'), ?, 'create', 'Tarefa criada pela repetição', ?, ? FROM json_each(?)`,
+      r.created_by, now, now, J(occ)),
+  ]);
+  return todo.length;
+}
+
+// Apaga de vez as ocorrências futuras que ninguém mexeu (updated_at = created_at),
+// para a série poder ser regerada com as novas regras. As que já foram editadas ficam.
+async function purgeUntouched(env, seriesId) {
+  const ids = (await all(env, `SELECT id FROM tasks WHERE recur_id = ? AND deleted = 0 AND due_date >= ? AND updated_at = created_at`,
+    seriesId, todayBR())).map(x => x.id);
+  if (ids.length) await env.DB.batch(['tasks WHERE id', 'activity WHERE task_id', 'subtasks WHERE task_id', 'task_members WHERE task_id']
+    .map(tw => q(env, `DELETE FROM ${tw} IN (SELECT value FROM json_each(?))`, J(ids))));
+  return ids.length;
+}
+
+async function generateAllSeries(env) {
+  const [rows, existing] = (await env.DB.batch([
+    q(env, 'SELECT * FROM recurrences WHERE deleted = 0'),
+    q(env, 'SELECT recur_id, due_date FROM tasks WHERE recur_id IS NOT NULL AND due_date >= ?', todayBR()),
+  ])).map(r => r.results);
+  const have = {};
+  for (const x of existing) (have[x.recur_id] ||= new Set()).add(x.due_date);
+  let n = 0;
+  for (const r of rows) {
+    try { n += await generateSeries(env, seriesOut(r), have[r.id] || new Set()); } catch (e) { console.error('recorrência', r.id, e && e.stack || e); }
+  }
+  if (n) await bump(env).run();
+  return n;
+}
+
+api('recur.save', {}, async ({ env, ctx, p }) => {
+  ctx.require('tasks.create');
+  const r = p.series || {};
+  const title = s(r.title, 200);
+  if (!title) throw new ApiError('Dê um título para a tarefa.');
+  if (!FREQS[r.freq]) throw new ApiError('Escolha de quanto em quanto tempo a tarefa se repete.');
+  const every = parseInt(r.every, 10) || 1;
+  if (every < 1 || every > 12) throw new ApiError('O intervalo deve ficar entre 1 e 12.');
+  const start = optDate(r.start_date);
+  if (!start) throw new ApiError('Informe a data da primeira ocorrência.');
+  const end = optDate(r.end_date);
+  if (end && end < start) throw new ApiError('A data final não pode ser antes da primeira ocorrência.');
+  const weekdays = [...new Set((Array.isArray(r.weekdays) ? r.weekdays : []).map(Number).filter(x => x >= 0 && x <= 6))].sort();
+  const assignee = await optRef(env, 'users', r.assignee_id);
+  const members = await cleanMembers(env, r.members, assignee);
+  const subs = await cleanSubtaskList(env, r.subtasks);
+  const others = [assignee, ...members, ...subs.map(x => x.assignee_id)].filter(u => u && u !== ctx.id);
+  if (others.length && !ctx.can('tasks.assign')) throw forbidden('Você só pode criar repetições para você mesmo.');
+  const d = {
+    title, description: s(r.description, 20000), item_id: await optRef(env, 'items', r.item_id), assignee_id: assignee,
+    members: JSON.stringify(members), subtasks: JSON.stringify(subs), priority: Math.min(4, Math.max(1, parseInt(r.priority, 10) || 2)),
+    freq: r.freq, every, weekdays: JSON.stringify(r.freq === 'weekly' && !weekdays.length ? [new Date(start + 'T00:00:00Z').getUTCDay()] : weekdays),
+    start_date: start, end_date: end, due_time: optTime(r.due_time),
+  };
+  const cols = Object.keys(d), now = nowIso();
+  let id = r.id;
+  if (id) {
+    const old = await first(env, 'SELECT * FROM recurrences WHERE id = ? AND deleted = 0', id);
+    if (!old) throw new ApiError('Esta repetição não existe mais.', 'notfound');
+    if (!canEditSeries(ctx, old)) throw forbidden('Você não pode alterar esta repetição.');
+    await q(env, `UPDATE recurrences SET ${cols.map(c => `${c} = ?`).join(', ')}, updated_at = ? WHERE id = ?`, ...cols.map(c => d[c]), now, id).run();
+    await purgeUntouched(env, id);
+  } else {
+    id = newId();
+    await q(env, `INSERT INTO recurrences (${cols.join(', ')}, id, created_by, created_at, updated_at) VALUES (${cols.map(() => '?').join(', ')}, ?, ?, ?, ?)`,
+      ...cols.map(c => d[c]), id, ctx.id, now, now).run();
+  }
+  const row = await first(env, 'SELECT * FROM recurrences WHERE id = ?', id);
+  const created = await generateSeries(env, seriesOut(row));
+  await bump(env).run();
+  return { id, created };
+});
+
+api('recur.stop', {}, async ({ env, ctx, p }) => {
+  const old = await first(env, 'SELECT * FROM recurrences WHERE id = ? AND deleted = 0', p.id || '');
+  if (!old) throw new ApiError('Esta repetição não existe mais.', 'notfound');
+  if (!canEditSeries(ctx, old)) throw forbidden('Você não pode alterar esta repetição.');
+  await q(env, 'UPDATE recurrences SET deleted = 1, updated_at = ? WHERE id = ?', nowIso(), old.id).run();
+  const removed = await purgeUntouched(env, old.id);
+  await bump(env).run();
+  return { removed };
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+//  MURAL DE RECADOS
+// ════════════════════════════════════════════════════════════════════════════
+api('posts.save', {}, async ({ env, ctx, p }) => {
+  const x = p.post || {};
+  const title = s(x.title, 120), body = s(x.body, 5000);
+  if (!body) throw new ApiError('Escreva o recado.');
+  const now = nowIso();
+  let id = x.id;
+  if (id) {
+    const old = await first(env, 'SELECT * FROM posts WHERE id = ? AND deleted = 0', id);
+    if (!old) throw new ApiError('Este recado não existe mais.', 'notfound');
+    if (old.user_id !== ctx.id) throw forbidden('Só quem escreveu pode editar o recado.');
+    await env.DB.batch([q(env, 'UPDATE posts SET title = ?, body = ?, updated_at = ? WHERE id = ?', title, body, now, id), bump(env)]);
+  } else {
+    id = newId();
+    const pinned = x.pinned && ctx.can('mural.manage') ? 1 : 0;
+    await env.DB.batch([
+      q(env, 'INSERT INTO posts (id, user_id, title, body, pinned, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)', id, ctx.id, title, body, pinned, now, now),
+      bump(env),
+    ]);
+  }
+  return { id };
+});
+
+api('posts.delete', {}, async ({ env, ctx, p }) => {
+  const old = await first(env, 'SELECT * FROM posts WHERE id = ? AND deleted = 0', p.id || '');
+  if (!old) throw new ApiError('Este recado não existe mais.', 'notfound');
+  if (old.user_id !== ctx.id && !ctx.can('mural.manage')) throw forbidden('Você não pode apagar recados de outras pessoas.');
+  await env.DB.batch([q(env, 'UPDATE posts SET deleted = 1, updated_at = ? WHERE id = ?', nowIso(), old.id), bump(env)]);
+  return true;
+});
+
+api('posts.pin', { perm: 'mural.manage' }, async ({ env, p }) => {
+  const r = await q(env, 'UPDATE posts SET pinned = ? WHERE id = ? AND deleted = 0', p.pinned ? 1 : 0, p.id || '').run();
+  if (!r.meta.changes) throw new ApiError('Este recado não existe mais.', 'notfound');
+  await bump(env).run();
+  return true;
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -523,6 +894,11 @@ api('users.save', { perm: 'users.manage' }, async ({ env, ctx, p }) => {
   if (!role) throw new ApiError('Escolha um cargo.');
   const managerId = await optRef(env, 'users', u.manager_id);
   const itemId = await optRef(env, 'items', u.item_id);
+  // Itens secundário e terciário: sem repetir o principal nem um ao outro.
+  let item2 = await optRef(env, 'items', u.item2_id), item3 = await optRef(env, 'items', u.item3_id);
+  if (item2 === itemId) item2 = null;
+  if (item3 === itemId || item3 === item2) item3 = null;
+  if (!item2 && item3) { item2 = item3; item3 = null; }
   const active = u.active === false || u.active === 0 ? 0 : 1;
   const password = String(u.password || ''), email = s(u.email, 200);
   if (await first(env, 'SELECT 1 AS x FROM users WHERE lower(username) = ? AND id <> ?', username, uid || ''))
@@ -541,13 +917,16 @@ api('users.save', { perm: 'users.manage' }, async ({ env, ctx, p }) => {
     await checkCycle(env, uid, managerId);
     if (!willBeAdmin && (await activeAdmins(env, { exceptUser: uid })) === 0)
       throw new ApiError('O sistema precisa ter pelo menos um administrador ativo.');
-    const stmts = [q(env, `UPDATE users SET username = ?, full_name = ?, email = ?, role_id = ?, manager_id = ?, item_id = ?, active = ?, updated_at = ?
-                           WHERE id = ?`, username, full_name, email, role.id, managerId, itemId, active, now, uid)];
+    const stmts = [q(env, `UPDATE users SET username = ?, full_name = ?, email = ?, role_id = ?, manager_id = ?, item_id = ?, item2_id = ?, item3_id = ?,
+                           active = ?, updated_at = ? WHERE id = ?`, username, full_name, email, role.id, managerId, itemId, item2, item3, active, now, uid)];
     if (password) {
       stmts.push(q(env, 'UPDATE users SET pw_hash = ?, must_change_pw = 1 WHERE id = ?', await hashPw(password), uid));
       stmts.push(q(env, 'DELETE FROM sessions WHERE user_id = ?', uid));
     }
-    if (!active) stmts.push(q(env, 'DELETE FROM sessions WHERE user_id = ?', uid));
+    if (!active) {
+      stmts.push(q(env, 'DELETE FROM sessions WHERE user_id = ?', uid));
+      stmts.push(q(env, 'UPDATE users SET badge = NULL WHERE id = ?', uid)); // quem sai deixa de ser capitão/vice
+    }
     stmts.push(bump(env));
     await env.DB.batch(stmts);
     return { id: uid };
@@ -557,8 +936,8 @@ api('users.save', { perm: 'users.manage' }, async ({ env, ctx, p }) => {
   const id = newId();
   try {
     await env.DB.batch([
-      q(env, `INSERT INTO users (id, username, full_name, email, pw_hash, role_id, manager_id, item_id, active, must_change_pw, created_at, updated_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`, id, username, full_name, email, await hashPw(password), role.id, managerId, itemId, active, now, now),
+      q(env, `INSERT INTO users (id, username, full_name, email, pw_hash, role_id, manager_id, item_id, item2_id, item3_id, active, must_change_pw, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`, id, username, full_name, email, await hashPw(password), role.id, managerId, itemId, item2, item3, active, now, now),
       bump(env),
     ]);
   } catch (e) {
@@ -566,6 +945,22 @@ api('users.save', { perm: 'users.manage' }, async ({ env, ctx, p }) => {
     throw e;
   }
   return { id };
+});
+
+// Capitão e vice-capitão: um título de destaque (não muda permissões; elas vêm do cargo).
+api('users.badge', { perm: 'team.captain' }, async ({ env, p }) => {
+  const captain = p.captain_id || null, vice = p.vice_id || null;
+  if (captain && captain === vice) throw new ApiError('Capitão e vice precisam ser pessoas diferentes.');
+  for (const id of [captain, vice].filter(Boolean))
+    if (!(await first(env, 'SELECT 1 AS x FROM users WHERE id = ? AND deleted = 0 AND active = 1', id)))
+      throw new ApiError('Escolha integrantes ativos.');
+  await env.DB.batch([
+    q(env, 'UPDATE users SET badge = NULL WHERE badge IS NOT NULL'),
+    q(env, "UPDATE users SET badge = 'captain' WHERE id = ?", captain || ''),
+    q(env, "UPDATE users SET badge = 'vice' WHERE id = ?", vice || ''),
+    bump(env),
+  ]);
+  return true;
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -619,18 +1014,21 @@ api('roles.delete', { perm: 'roles.manage' }, async ({ env, ctx, p }) => {
 // ════════════════════════════════════════════════════════════════════════════
 //  ADMINISTRAÇÃO
 // ════════════════════════════════════════════════════════════════════════════
-const BACKUP_TABLES = ['meta', 'roles', 'users', 'items', 'tasks', 'comments', 'activity'];
+const BACKUP_TABLES = ['meta', 'roles', 'users', 'items', 'tasks', 'comments', 'activity', 'subtasks', 'task_members', 'posts', 'recurrences'];
 
 api('system.status', { perm: 'system.admin' }, async ({ env }) => {
-  const [t, u, i, c, sess, ver] = (await env.DB.batch([
+  const [t, u, i, c, sess, ver, po, rc] = (await env.DB.batch([
     q(env, 'SELECT COUNT(*) AS n FROM tasks WHERE deleted = 0'),
     q(env, 'SELECT COUNT(*) AS n FROM users WHERE deleted = 0'),
     q(env, 'SELECT COUNT(*) AS n FROM items WHERE deleted = 0'),
     q(env, 'SELECT COUNT(*) AS n FROM comments WHERE deleted = 0'),
     q(env, 'SELECT COUNT(*) AS n FROM sessions WHERE expires_at > ?', nowIso()),
     q(env, "SELECT value FROM meta WHERE key = 'data_version'"),
+    q(env, 'SELECT COUNT(*) AS n FROM posts WHERE deleted = 0'),
+    q(env, 'SELECT COUNT(*) AS n FROM recurrences WHERE deleted = 0'),
   ])).map(r => r.results[0]);
-  return { version: APP_VERSION, counts: { tasks: t.n, users: u.n, items: i.n, comments: c.n, sessions: sess.n }, data_version: ver.value };
+  return { version: APP_VERSION, counts: { tasks: t.n, users: u.n, items: i.n, comments: c.n, sessions: sess.n, posts: po.n, series: rc.n },
+    data_version: ver.value };
 });
 
 // Backup completo em SQL. Restaurar (substitui todos os dados):
