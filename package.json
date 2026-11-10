@@ -1,0 +1,13 @@
+{
+  "name": "bajadegalpao-tasks",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Gerenciador de tarefas da equipe Baja de Galpão (Cloudflare Workers + D1)",
+  "scripts": {
+    "dev": "npx -y wrangler@4.153.0 dev --port 8787",
+    "db:local": "npx -y wrangler@4.153.0 d1 migrations apply bajadegalpao-tasks --local",
+    "db:remote": "npx -y wrangler@4.153.0 d1 migrations apply bajadegalpao-tasks --remote",
+    "deploy": "npx -y wrangler@4.153.0 deploy",
+    "login": "npx -y wrangler@4.153.0 login"
+  }
+}

@@ -1,0 +1,22 @@
+// Configuração do Cloudflare Worker — Baja de Galpão Tasks
+{
+  "name": "bajadegalpao-tasks",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": true,
+  // Interface (HTML/CSS/JS/ícones). Rotas /api/* não são arquivos e caem no Worker.
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "bajadegalpao-tasks",
+      // Banco D1 na nuvem (criado em 10/11/2026, região ENAM).
+      "database_id": "90f6a762-ef4a-44f8-a428-7e93a0c151aa",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "observability": { "enabled": true }
+}

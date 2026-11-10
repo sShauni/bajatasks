@@ -1,0 +1,21 @@
+# Banco local de testes e cache do wrangler
+.wrangler/
+
+# Dependências (se um dia forem instaladas)
+node_modules/
+
+# Backups baixados do app: contêm os hashes das senhas da equipe
+*.sql
+!migrations/*.sql
+
+# Segredos locais
+.dev.vars
+.dev.vars.*
+.env
+.env.*
+
+# Lixo do sistema / editor
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
